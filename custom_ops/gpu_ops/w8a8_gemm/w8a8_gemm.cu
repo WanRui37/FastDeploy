@@ -21,8 +21,6 @@
 #include "w8a8_gemm_template.h"
 #include "w8a8_gemm.h"
 
-// 移除weight_convert函数，因为int8不需要特殊的权重转换
-
 template <typename T> class NVTraits;
 
 template <> class NVTraits<int8_t> {
@@ -163,110 +161,14 @@ void DisPatchW8A8GemmWrapper(
         stream);
 }
 
-// 移除W4AFp8GemmWeightConvert函数，因为int8不需要权重转换
-
-template <typename T, int kPackSize>
-__global__ void permute_scale_kernel(
-        T* input_data,
-        const int numel) {
-    using LoadT = AlignedVector<T, kPackSize>;
-    LoadT input_vec;
-    LoadT dst_vec;
-    const int load_idx = (blockIdx.x * blockDim.x + threadIdx.x) * kPackSize;
-    if (load_idx >= numel) {
-        return;
-    }
-    Load<T, kPackSize>(&input_data[load_idx], &input_vec);
-
-    for (int i = 0; i < kPackSize; i+=2) {
-        dst_vec[i] = input_vec[i / 2];
-        dst_vec[i + 1] = input_vec[i / 2 + 8];
-    }
-
-    Store<T, kPackSize>(dst_vec, &input_data[load_idx]);
-}
-
-void W4AFp8GemmScalePermute(const paddle::Tensor& scale) {
-    const int row = scale.dims().size() == 2 ? scale.dims()[0] : 1;
-    const int col = scale.dims().size() == 2 ? scale.dims()[1] : scale.dims()[0];
-    if (col % 16 != 0) {
-        PD_THROW("Only supported when col is divisible by 16.");
-    }
-    const int numel = row * col;
-    const int threads = 128;
-    const int kPackSize = 16;
-    const int grid_size = (numel / kPackSize + threads - 1) / threads;
-
-    if (scale.dtype() == paddle::DataType::BFLOAT16) {
-        permute_scale_kernel<phi::dtype::bfloat16, kPackSize><<<grid_size, threads, 0, scale.stream()>>>(
-            const_cast<phi::dtype::bfloat16*>(scale.data<phi::dtype::bfloat16>()),
-            numel
-        );
-    } else if (scale.dtype() == paddle::DataType::FLOAT16) {
-        permute_scale_kernel<phi::dtype::float16, kPackSize><<<grid_size, threads, 0, scale.stream()>>>(
-            const_cast<phi::dtype::float16*>(scale.data<phi::dtype::float16>()),
-            numel
-        );
-    } else if (scale.dtype() == paddle::DataType::FLOAT32) {
-        permute_scale_kernel<float, kPackSize><<<grid_size, threads, 0, scale.stream()>>>(
-            const_cast<float*>(scale.data<float>()),
-            numel
-        );
-    }
-
-}
-
-PD_BUILD_STATIC_OP(w4afp8_gemm_scale_permute)
-    .Inputs({"weight_scale"})
-    .Outputs({"permute_scale"})
-    .SetInplaceMap({{"weight_scale", "permute_scale"}})
-    .SetKernelFn(PD_KERNEL(W4AFp8GemmScalePermute));
-
-PD_BUILD_STATIC_OP(w4afp8_gemm)
+PD_BUILD_STATIC_OP(w8a8_gemm)
     .Inputs({"input",
              "weight",
              "tokens",
-             "input_row_sum",
+             "input_scale",
              "weight_scale"})
     .Outputs({"out"})
     .Attrs({"token_padding_size: int64_t",
             "max_tokens: int64_t",
             "is_bfloat16: bool"})
-    .SetKernelFn(PD_KERNEL(W4AFp8Gemm));
-
-PD_BUILD_STATIC_OP(w4afp8_gemm_weight_convert)
-    .Inputs({"weight"})
-    .Outputs({"converted_weight"})
-    .SetKernelFn(PD_KERNEL(W4AFp8GemmWeightConvert));
-
-template void DisPatchW4AFp8GemmWrapper<__nv_fp8_e4m3, __nv_bfloat16>(
-        const __nv_fp8_e4m3* input,
-        const __nv_fp8_e4m3* weight,
-        const int64_t * tokens,
-        const float * input_row_sum,
-        const float * row_scale,
-        const float * weight_scale,
-        __nv_bfloat16 * out,
-        const int64_t token_padding_size,
-        const int64_t max_tokens,
-        const int num_experts,
-        const int64_t M,
-        const int64_t K,
-        cudaStream_t stream
-);
-
-template void DisPatchW4AFp8GemmWrapper<__nv_fp8_e4m3, half>(
-        const __nv_fp8_e4m3* input,
-        const __nv_fp8_e4m3* weight,
-        const int64_t * tokens,
-        const float * input_row_sum,
-        const float * row_scale,
-        const float * weight_scale,
-        half * out,
-        const int64_t token_padding_size,
-        const int64_t max_tokens,
-        const int num_experts,
-        const int64_t M,
-        const int64_t K,
-        cudaStream_t stream
-);
+    .SetKernelFn(PD_KERNEL(W8A8Gemm));

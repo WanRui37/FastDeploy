@@ -33,6 +33,10 @@ struct SharedStorage {
         };
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutC>> smem_c;
     };
+
+  struct {
+    typename cutlass::PipelineAsync<kStages>::SharedStorage pipeline;
+  };
 };
 
 template<int kBlockM_, int kBlockN_, int kBlockK_,
@@ -73,16 +77,16 @@ struct Kernel_traits {
     static constexpr int kStages = kStages_;
     static_assert(kStages > 1);
 
-    // 使用适用于int8的MMA操作
+    using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
+
     using TiledMma = decltype(cute::make_tiled_mma(
         cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK>(),
-        Layout<Shape<Int<kBlockM / 64>, _1, _1>>{}));
+        AtomLayoutMNK{}));
 
     using TiledMma_TAIL = decltype(cute::make_tiled_mma(
         cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK_TAIL>(),
-        Layout<Shape<Int<kBlockM / 64>, _1, _1>>{}));
+        AtomLayoutMNK{}));
 
-    // 使用适用于sm80+的共享内存布局
     using SmemLayoutAtomA = decltype(
         cutlass::gemm::collective::detail::rs_smem_selector<
             GMMA::Major::K, Element, Int<kBlockM>, Int<kBlockK>>());
@@ -93,28 +97,57 @@ struct Kernel_traits {
 
     using SmemLayoutAtomB = decltype(
         cutlass::gemm::collective::detail::rs_smem_selector<
-            GMMA::Major::K, Element, Int<kBlockN>, Int<kBlockK>>());
+            GMMA::Major::K, Element, decltype(cute::get<1>(TileShape_MNK{})),
+            decltype(cute::get<2>(TileShape_MNK{}))>());
 
     using SmemLayoutB = decltype(
         tile_to_shape(SmemLayoutAtomB{},
-            make_shape(Int<kBlockN>{}, Int<kBlockK>{}, Int<kStages>{})));
+            make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
 
-    // 使用适用于sm80+的复制原子操作
+    using SmemLayoutAtomB_TAIL = decltype(
+        cutlass::gemm::collective::detail::rs_smem_selector<
+            GMMA::Major::K, Element, decltype(cute::get<1>(TileShape_MNK_TAIL{})),
+            decltype(cute::get<2>(TileShape_MNK_TAIL{}))>());
+
+    using SmemLayoutB_TAIL = decltype(
+        tile_to_shape(SmemLayoutAtomB_TAIL{},
+            make_shape(
+                shape<1>(TileShape_MNK_TAIL{}),
+                shape<2>(TileShape_MNK_TAIL{}),
+                Int<kStages>{})
+            ));
+
+    using SmemLayoutAtomC = decltype(
+        cutlass::gemm::collective::detail::rs_smem_selector<
+        GMMA::Major::K, ElementOutput,
+        decltype(cute::get<0>(TileShape_MNK{})),
+        decltype(cute::get<1>(TileShape_MNK{}))>());
+
+    using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{}, select<0, 1>(TileShape_MNK{})));
+
     using SmemCopyAtomAB = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomC = Copy_Atom<cute::SM75_U32x4_STSM_N, ElementOutput>;
+    using SmemCopyAtomC = Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, ElementOutput>;
 
     using SharedStorage = SharedStorage<
         kStages, Element, ElementOutput, SmemLayoutA, SmemLayoutB, SmemLayoutC>;
 
-    // 使用通用的流水线实现，不依赖TMA
     using MainloopPipeline = typename cutlass::PipelineAsync<kStages>;
     using PipelineState = typename cutlass::PipelineState<kStages>;
 
-    // 简化输出复制逻辑
+    static constexpr int kNumVecElem = ceil_div(128, cutlass::sizeof_bits_v<OutputType>);
+    static constexpr int kNumThreadsPerRow = kBlockN / kNumVecElem;
+    static constexpr int kNumRows = NumMmaThreads / kNumThreadsPerRow;
+
     using TiledCopyCAtom = cute::Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, OutputType>;
-    using TiledCopyC = decltype(make_tiled_copy(
+    using TiledCopyCThrLayout = decltype(cute::make_layout(
+        cute::make_shape(Int<kNumRows>{}, Int<kNumThreadsPerRow>{}),
+        cute::LayoutRight{}));
+    using TiledCopyCValLayout = decltype(cute::make_layout(
+        cute::make_shape(cute::_1{}, Int<kNumVecElem>{}),
+        cute::LayoutRight{}));
+    using TiledCopyC = decltype(cute::make_tiled_copy(
         TiledCopyCAtom{},
-        Layout<Shape<Int<NumMmaThreads / 4>, Int<4>>>{},
-        Layout<Shape<_1{}, Int<kBlockN / 4>>>{}
+        TiledCopyCThrLayout{},
+        TiledCopyCValLayout{}
     ));
 };
