@@ -65,48 +65,39 @@ __forceinline__ __device__ void convert_c4_2_fp8(const int32_t * src, int32_t * 
     }
 }
 
-template <int wg_wait=0, bool arrive=true,
-    bool commit=true, typename Tensor0, typename Tensor1,
-    typename Tensor2, typename Tensor3, typename TiledMma,
-    typename ThrCopyA, typename TiledCopyA>
+template <int numel>
+__forceinline__ __device__ void convert_int8_2_int32(const int8_t * src, int32_t * dst) {
+    #pragma unroll
+    for (int i = 0; i < numel; ++i) {
+        dst[i] = static_cast<int32_t>(src[i]);
+    }
+}
+
+// 简化GEMM函数，适配int8计算
+template <bool arrive=true, bool commit=true, typename Tensor0, typename Tensor1,
+    typename Tensor2, typename Tensor3, typename TiledMma>
 __forceinline__ __device__ void gemm(
         TiledMma &tiled_mma,
         Tensor0 &tCrA,
         Tensor1 &tCsA,
         Tensor2 const &tCrB,
-        Tensor3 &tCrC,
-        TiledCopyA const &tiled_copy_A,
-        ThrCopyA const &thr_copy_A) {
-    constexpr bool Is_RS = !cute::is_base_of<cute::GMMA::DescriptorIterator, typename TiledMma::FrgTypeA>::value;
-    Tensor tCrA1 = make_tensor<cutlass::float_e4m3_t>(tCrA.layout());
-    Tensor tCrA2 = make_tensor<cutlass::float_e4m3_t>(tCrA.layout());
-    if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
+        Tensor3 &tCrC) {
+
     warpgroup_fence_operand(tCrC);
     if constexpr (arrive) {
         warpgroup_arrive();
     }
-    constexpr int numel = decltype(size(tCrA(_, _, 0)))::value / 4;
-
-    Tensor tCrA_copy_view = thr_copy_A.retile_D(tCrA);
-    cute::copy(tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{}));
 
     CUTLASS_PRAGMA_UNROLL
     for (int k_block = 0; k_block < size<2>(tCrA); ++k_block) {
-        if (k_block < size<2>(tCrA) - 1) {
-            cute::copy(tiled_copy_A, tCsA(_, _, k_block + 1), tCrA_copy_view(_, _, k_block + 1));
-        }
-        int32_t * tCrA_data = reinterpret_cast<int32_t *>(tCrA(_,_,k_block).data());
-        int32_t * tCrA1_data = reinterpret_cast<int32_t *>(tCrA1(_,_,k_block).data());
-        int32_t * tCrA2_data = reinterpret_cast<int32_t *>(tCrA2(_,_,k_block).data());
-        convert_c4_2_fp8<numel>(tCrA_data, tCrA1_data, tCrA2_data);
-
-        cute::gemm(tiled_mma, tCrA1(_,_,k_block), tCrB(_,_,2 * k_block), tCrC);
-        cute::gemm(tiled_mma, tCrA2(_,_,k_block), tCrB(_,_, 2 * k_block + 1), tCrC);
+        // 直接进行int8矩阵乘法，累积到int32
+        cute::gemm(tiled_mma, tCrA(_,_,k_block), tCrB(_,_,k_block), tCrC);
     }
+
     if constexpr (commit) {
         warpgroup_commit_batch();
     }
-    if constexpr (wg_wait >= 0) { warpgroup_wait<wg_wait>(); }
+
+    warpgroup_wait<0>();
     warpgroup_fence_operand(tCrC);
-    if constexpr (Is_RS) { warpgroup_fence_operand(const_cast<Tensor0 &>(tCrA)); }
 }

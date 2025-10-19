@@ -395,8 +395,8 @@ elif paddle.is_compiled_with_cuda():
         sources += find_end_files("gpu_ops/moe/", ".cu")
         nvcc_compile_args += ["-Igpu_ops/moe"]
         # moe int8*int8
-        os.system("python utils/auto_gen_w4a8_gemm_kernel.py")
-        sources += find_end_files("gpu_ops/w4a8_gemm", ".cu")
+        os.system("python utils/auto_gen_w8a8_gemm_kernel.py")
+        sources += find_end_files("gpu_ops/w8a8_gemm", ".cu")
 
     if cc >= 89:
         # Running generate fp8 gemm codes.

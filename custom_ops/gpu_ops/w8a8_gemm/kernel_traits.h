@@ -33,10 +33,6 @@ struct SharedStorage {
         };
         cute::array_aligned<OutputType, cute::cosize_v<SmemLayoutC>> smem_c;
     };
-
-  struct {
-    typename cutlass::PipelineTmaAsync<kStages>::SharedStorage pipeline;
-  };
 };
 
 template<int kBlockM_, int kBlockN_, int kBlockK_,
@@ -45,11 +41,11 @@ template<int kBlockM_, int kBlockN_, int kBlockK_,
         int TokenPackSize_,
         int TAIL_N_ = 0,
         int kClusterM_ = 1,
-        typename elem_type=cutlass::float_e4m3_t,
+        typename elem_type=cutlass::int8_t,
         typename OutputType = cutlass::bfloat16_t>
 struct Kernel_traits {
     using Element = elem_type;
-    using ElementAccum = float;
+    using ElementAccum = int32_t;
     using ElementOutput = OutputType;
     static_assert(cutlass::sizeof_bits_v<Element> == 8);
 
@@ -77,78 +73,48 @@ struct Kernel_traits {
     static constexpr int kStages = kStages_;
     static_assert(kStages > 1);
 
-    using AtomLayoutMNK = Layout<Shape<Int<kBlockM / 64>, _1, _1>>;
-
+    // 使用适用于int8的MMA操作
     using TiledMma = decltype(cute::make_tiled_mma(
         cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK>(),
-        AtomLayoutMNK{}));
+        Layout<Shape<Int<kBlockM / 64>, _1, _1>>{}));
 
     using TiledMma_TAIL = decltype(cute::make_tiled_mma(
         cute::GMMA::rs_op_selector<Element, Element, ElementAccum, TileShape_MNK_TAIL>(),
-        AtomLayoutMNK{}));
+        Layout<Shape<Int<kBlockM / 64>, _1, _1>>{}));
 
+    // 使用适用于sm80+的共享内存布局
     using SmemLayoutAtomA = decltype(
         cutlass::gemm::collective::detail::rs_smem_selector<
-            GMMA::Major::K, Element, Int<kBlockM>, Int<kBlockK / 2>>());
+            GMMA::Major::K, Element, Int<kBlockM>, Int<kBlockK>>());
 
     using SmemLayoutA = decltype(
         tile_to_shape(SmemLayoutAtomA{},
-            make_shape(Int<kBlockM>{}, Int<kBlockK / 2>{}, Int<kStages>{})));
+            make_shape(Int<kBlockM>{}, Int<kBlockK>{}, Int<kStages>{})));
 
     using SmemLayoutAtomB = decltype(
         cutlass::gemm::collective::detail::rs_smem_selector<
-            GMMA::Major::K, Element, decltype(cute::get<1>(TileShape_MNK{})),
-            decltype(cute::get<2>(TileShape_MNK{}))>());
+            GMMA::Major::K, Element, Int<kBlockN>, Int<kBlockK>>());
 
     using SmemLayoutB = decltype(
         tile_to_shape(SmemLayoutAtomB{},
-            make_shape(shape<1>(TileShape_MNK{}), shape<2>(TileShape_MNK{}), Int<kStages>{})));
+            make_shape(Int<kBlockN>{}, Int<kBlockK>{}, Int<kStages>{})));
 
-    using SmemLayoutAtomB_TAIL = decltype(
-        cutlass::gemm::collective::detail::rs_smem_selector<
-            GMMA::Major::K, Element, decltype(cute::get<1>(TileShape_MNK_TAIL{})),
-            decltype(cute::get<2>(TileShape_MNK_TAIL{}))>());
-
-    using SmemLayoutB_TAIL = decltype(
-        tile_to_shape(SmemLayoutAtomB_TAIL{},
-            make_shape(
-                shape<1>(TileShape_MNK_TAIL{}),
-                shape<2>(TileShape_MNK_TAIL{}),
-                Int<kStages>{})
-            ));
-
-    using SmemLayoutAtomC = decltype(
-        cutlass::gemm::collective::detail::rs_smem_selector<
-        GMMA::Major::K, ElementOutput,
-        decltype(cute::get<0>(TileShape_MNK{})),
-        decltype(cute::get<1>(TileShape_MNK{}))>());
-
-    using SmemLayoutC = decltype(tile_to_shape(SmemLayoutAtomC{}, select<0, 1>(TileShape_MNK{})));
-
+    // 使用适用于sm80+的复制原子操作
     using SmemCopyAtomAB = Copy_Atom<cute::SM75_U32x4_LDSM_N, Element>;
-    using SmemCopyAtomC = Copy_Atom<cute::SM90_U32x4_STSM_N, ElementOutput>;
+    using SmemCopyAtomC = Copy_Atom<cute::SM75_U32x4_STSM_N, ElementOutput>;
 
     using SharedStorage = SharedStorage<
         kStages, Element, ElementOutput, SmemLayoutA, SmemLayoutB, SmemLayoutC>;
 
-    using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
+    // 使用通用的流水线实现，不依赖TMA
+    using MainloopPipeline = typename cutlass::PipelineAsync<kStages>;
     using PipelineState = typename cutlass::PipelineState<kStages>;
 
-
-    static constexpr int kNumVecElem = ceil_div(128, sizeof_bits_v<OutputType>);
-    static constexpr int kNumThreadsPerRow = kBlockN / kNumVecElem;
-    // static_assert(NumMmaThreads % kNumThreadsPerRow == 0);
-    static constexpr int kNumRows = NumMmaThreads / kNumThreadsPerRow;
+    // 简化输出复制逻辑
     using TiledCopyCAtom = cute::Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, OutputType>;
-    using TiledCopyCThrLayout = decltype(cute::make_layout(
-        cute::make_shape(Int<kNumRows>{}, Int<kNumThreadsPerRow>{}),
-        LayoutRight{}));
-    using TiledCopyCValLayout = decltype(cute::make_layout(
-        cute::make_shape(_1{}, Int<kNumVecElem>{}),
-        LayoutRight{}));
     using TiledCopyC = decltype(make_tiled_copy(
         TiledCopyCAtom{},
-        TiledCopyCThrLayout{}, // Thr layout
-        TiledCopyCValLayout{} // Val layout
+        Layout<Shape<Int<NumMmaThreads / 4>, Int<4>>>{},
+        Layout<Shape<_1{}, Int<kBlockN / 4>>>{}
     ));
 };

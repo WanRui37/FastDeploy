@@ -21,30 +21,13 @@
 #include "w8a8_gemm_template.h"
 #include "w8a8_gemm.h"
 
-
-void weight_convert(const uint8_t *weight, uint8_t *weight_new, int batch, int M, int K) {
-    assert(K % 64 == 0);
-    for (int b = 0; b < batch; ++b) {
-        for (int m = 0; m < M; ++m) {
-            for (int k = 0; k < K; k+=64) {
-                for (int k_inner = 0; k_inner < 32; ++k_inner) {
-                    uint8_t temp = 0;
-                    uint8_t left = weight[b * M * K + m * K + k + k_inner];
-                    uint8_t right = weight[b * M * K + m * K + k + k_inner + 32];
-                    temp |= left << 4;
-                    temp |= right;
-                    weight_new[b * M * K / 2 + m * K / 2 + k / 2 + k_inner] = *reinterpret_cast<uint8_t*>(&temp);
-                }
-            }
-        }
-    }
-}
+// 移除weight_convert函数，因为int8不需要特殊的权重转换
 
 template <typename T> class NVTraits;
 
-template <> class NVTraits<__nv_fp8_e4m3> {
+template <> class NVTraits<int8_t> {
 public:
-    typedef cutlass::float_e4m3_t data_t;
+    typedef int8_t data_t;
 };
 
 template <> class NVTraits<__nv_bfloat16>{
@@ -52,20 +35,12 @@ public:
     typedef cutlass::bfloat16_t data_t;
 };
 
-template <> class NVTraits<half>{
-public:
-    typedef cutlass::half_t data_t;
-};
-
-
-
-
 template <typename OutputType>
-void DisPatchW4AFp8Gemm(
-        const cutlass::float_e4m3_t* input,
-        const cutlass::float_e4m3_t* weight,
+void DisPatchW8A8Gemm(
+        const int8_t* input,
+        const int8_t* weight,
         const int64_t * tokens,
-        const float * input_row_sum,
+        const float * input_scale,
         const float * weight_scale,
         OutputType * out,
         const int64_t token_padding_size,
@@ -84,7 +59,7 @@ void DisPatchW4AFp8Gemm(
             input,
             out,
             weight_scale,
-            input_row_sum,
+            input_scale,
             tokens,
             max_tokens,
             stream)
@@ -93,23 +68,22 @@ void DisPatchW4AFp8Gemm(
     }
 }
 
-std::vector<paddle::Tensor> W4AFp8Gemm(
+std::vector<paddle::Tensor> W8A8Gemm(
         const paddle::Tensor& input,
         const paddle::Tensor& weight,
-        const paddle::Tensor& tokens, // If tokenpadding=0, this tensor represents the prefix sum of tensors, otherwise it represents the number of tokens in each group
-        const paddle::Tensor& input_row_sum,
+        const paddle::Tensor& tokens,
+        const paddle::Tensor& input_scale,
         const paddle::Tensor& weight_scale,
         const int64_t token_padding_size,
         const int64_t max_tokens,
         const bool is_bfloat16) {
 
-
     const int batch_size = weight.dims()[0];
     const int M = weight.dims()[1];
-    const int K = weight.dims()[2] * 2;
+    const int K = weight.dims()[2];
 
-    if (input.dtype() != paddle::DataType::FLOAT8_E4M3FN) {
-        PD_THROW("Only supported dtype in ['FLOAT8_E4M3FN'].");
+    if (input.dtype() != paddle::DataType::INT8) {
+        PD_THROW("Only supported dtype in ['INT8'].");
     }
 
     if (token_padding_size == 0) {
@@ -117,11 +91,11 @@ std::vector<paddle::Tensor> W4AFp8Gemm(
         if (is_bfloat16) {
             paddle::Tensor out = paddle::empty({all_tokens, M}, paddle::DataType::BFLOAT16, input.place());
             phi::dtype::bfloat16 *out_data = out.data<phi::dtype::bfloat16>();
-            DisPatchW4AFp8Gemm(
-                reinterpret_cast<const cutlass::float_e4m3_t*>(input.data<phi::dtype::float8_e4m3fn>()),
-                reinterpret_cast<const cutlass::float_e4m3_t*>(weight.data<uint8_t>()),
+            DisPatchW8A8Gemm(
+                input.data<int8_t>(),
+                weight.data<int8_t>(),
                 tokens.data<int64_t>(),
-                input_row_sum.data<float>(),
+                input_scale.data<float>(),
                 weight_scale.data<float>(),
                 reinterpret_cast<cutlass::bfloat16_t*>(out_data),
                 token_padding_size,
@@ -138,11 +112,11 @@ std::vector<paddle::Tensor> W4AFp8Gemm(
         if (is_bfloat16) {
             paddle::Tensor out = paddle::empty({batch_size, token_padding_size, M}, paddle::DataType::BFLOAT16, input.place());
             phi::dtype::bfloat16 * out_data = out.data<phi::dtype::bfloat16>();
-            DisPatchW4AFp8Gemm(
-                reinterpret_cast<const cutlass::float_e4m3_t*>(input.data<phi::dtype::float8_e4m3fn>()),
-                reinterpret_cast<const cutlass::float_e4m3_t*>(weight.data<uint8_t>()),
+            DisPatchW8A8Gemm(
+                input.data<int8_t>(),
+                weight.data<int8_t>(),
                 tokens.data<int64_t>(),
-                input_row_sum.data<float>(),
+                input_scale.data<float>(),
                 weight_scale.data<float>(),
                 reinterpret_cast<cutlass::bfloat16_t*>(out_data),
                 token_padding_size,
@@ -159,12 +133,11 @@ std::vector<paddle::Tensor> W4AFp8Gemm(
 }
 
 template <typename InputType, typename OutputType>
-void DisPatchW4AFp8GemmWrapper(
+void DisPatchW8A8GemmWrapper(
         const InputType* input,
         const InputType* weight,
         const int64_t* total_rows_before_expert,
-        const float* input_row_sum,
-        const float* row_scale,
+        const float* input_scale,
         const float* weight_scale,
         OutputType * out,
         const int64_t token_padding_size,
@@ -175,11 +148,11 @@ void DisPatchW4AFp8GemmWrapper(
         cudaStream_t stream) {
     using InType = typename NVTraits<InputType>::data_t;
     using OutType = typename NVTraits<OutputType>::data_t;
-    DisPatchW4AFp8Gemm(
+    DisPatchW8A8Gemm(
         reinterpret_cast<const InType*>(input),
         reinterpret_cast<const InType*>(weight),
         total_rows_before_expert,
-        input_row_sum,
+        input_scale,
         weight_scale,
         reinterpret_cast<OutType*>(out),
         token_padding_size,
@@ -190,15 +163,7 @@ void DisPatchW4AFp8GemmWrapper(
         stream);
 }
 
-
-std::vector<paddle::Tensor> W4AFp8GemmWeightConvert(const paddle::Tensor& weight) {
-    const int batch_size = weight.dims()[0];
-    const int M = weight.dims()[1];
-    const int K = weight.dims()[2];
-    paddle::Tensor weight_new = paddle::empty({batch_size, M, K / 2}, paddle::DataType::UINT8, weight.place());
-    weight_convert(weight.data<uint8_t>(), weight_new.data<uint8_t>(), batch_size, M, K);
-    return {weight_new};
-}
+// 移除W4AFp8GemmWeightConvert函数，因为int8不需要权重转换
 
 template <typename T, int kPackSize>
 __global__ void permute_scale_kernel(

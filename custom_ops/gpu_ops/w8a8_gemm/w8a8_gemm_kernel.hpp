@@ -27,7 +27,7 @@
 #include "mainloop_fwd.h"
 
 template <typename Ktraits>
-void  __global__ __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1) w4afp8_gemm_kernel(
+void  __global__ __launch_bounds__(Ktraits::kNWarps * cutlass::NumThreadsPerWarp, 1) w8a8_gemm_kernel(
         CUTE_GRID_CONSTANT typename CollectiveMainloopFwd<Ktraits>::Params const mainloop_params) {
 
     using Element = typename Ktraits::Element;
@@ -231,7 +231,7 @@ void run_gemm(const InputType * A, const InputType * B, OutputType * C, const fl
         });
 
     void *kernel;
-    kernel = (void *)w4afp8_gemm_kernel<Kernel_traits>;
+    kernel = (void *)w8a8_gemm_kernel<Kernel_traits>;
 
     int smem_size = sizeof(typename Kernel_traits::SharedStorage) + sizeof(float) * Kernel_traits::kBlockN;
 

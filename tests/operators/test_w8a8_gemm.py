@@ -17,7 +17,7 @@ import unittest
 import numpy as np
 import paddle
 
-from fastdeploy.model_executor.ops.gpu import w8a8_gemm, w8a8_gemm_weight_convert
+from fastdeploy.model_executor.ops.gpu import w8a8_gemm
 
 
 class TestW8A8GEMM(unittest.TestCase):
@@ -39,13 +39,13 @@ class TestW8A8GEMM(unittest.TestCase):
         self.input_bf16 = paddle.randn([self.all_tokens, self.K], dtype="bfloat16") / 10
 
         self.weight = paddle.randn([self.BATCH, self.N, self.K], dtype="bfloat16") / 10
-        self.weight_scale = 127 / self.weight.abs().max(axis=-1).reshape([self.BATCH, self.N, 1])
-        self.weight_quant = (self.weight * self.weight_scale).astype("int8")
-        self.weight_dequant_scale = 1 / self.weight_scale.astype("float32")
+        self.weight_scale = (self.weight.abs().max(axis=-1) / 127).reshape([self.BATCH, self.N, 1])
+        self.weight_quant = paddle.clip(self.weight / self.weight_scale, -127, 127).astype("int8")
+        self.weight_dequant_scale = self.weight_scale.astype("float32")
 
-        self.input_scale = 127 / self.input_bf16.abs().max(axis=1).reshape([self.all_tokens, 1])
-        self.input_quant = (self.input_bf16 * self.input_scale).astype("int8")
-        self.input_dequant_scale = 1 / self.input_scale.astype("float32")
+        self.input_scale = (self.input_bf16.abs().max(axis=1) / 127).reshape([self.all_tokens, 1])
+        self.input_quant = paddle.clip(self.input_bf16 / self.input_scale, -127, 127).astype("int8")
+        self.input_dequant_scale = self.input_scale.astype("float32")
 
         self.max_tokens = int(self.tokens.max())
 
@@ -72,16 +72,14 @@ class TestW8A8GEMM(unittest.TestCase):
             self.input_quant, self.weight_quant, self.tokens, self.input_dequant_scale, self.weight_dequant_scale
         )
 
-        weight_int8 = self.weight_quant.astype("int8").cpu()
-        weight_int8_processed = w8a8_gemm_weight_convert(weight_int8)
-
+        weight_int8 = self.weight_quant.astype("int8")
         input_scale_for_kernel = self.input_scale.astype("float32")  # 用于GPU内部反量化
 
         # 调用W8A8 GEMM（输入和权重都是int8）
         if self.TokenPadding == 0:
             out_cuda = w8a8_gemm(
                 self.input_quant.cuda(),  # 输入已经是int8量化后的数据
-                weight_int8_processed.cuda(),
+                weight_int8.cuda(),
                 self.tokens_prefix_sum,
                 input_scale_for_kernel.cuda(),  # 传递激活的scale
                 self.weight_dequant_scale.astype("float32"),  # 权重的scale
@@ -92,7 +90,7 @@ class TestW8A8GEMM(unittest.TestCase):
         else:
             out_cuda = w8a8_gemm(
                 self.input_quant.cuda(),
-                weight_int8_processed.cuda(),
+                weight_int8.cuda(),
                 self.tokens,
                 input_scale_for_kernel.cuda(),
                 self.weight_dequant_scale.astype("float32"),
@@ -103,7 +101,7 @@ class TestW8A8GEMM(unittest.TestCase):
 
         # 验证误差
         gap = (out_cuda - out_naive).abs()
-        self.assertLess(float(gap.mean()), 0.1)  # 可能需要调整容忍误差
+        self.assertLess(float(gap.mean()), 0.07)  # 可能需要调整容忍误差
 
 
 if __name__ == "__main__":
