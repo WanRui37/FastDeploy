@@ -94,7 +94,7 @@ template <
     typename EpilogueOutputOp_,
     typename ThreadblockSwizzle_,
     int Stages,
-    typename GroupScheduleMode_ = cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly,
+    typename GroupScheduleMode_ = cutlass::gemm::kernel::GroupScheduleMode,
     typename Operator_ = cutlass::arch::OpMultiplyAdd
 >
 struct DefaultW8A8GemmGrouped {

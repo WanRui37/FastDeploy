@@ -124,25 +124,27 @@ public:
         }
     };
 
-    // Grouped GEMM kernel type
+    // Grouped GEMM kernel type - simplified template instantiation
     using GemmKernel = typename cutlass::gemm::kernel::DefaultW8A8GemmGrouped<
-        Config::ElementA,
-        Config::LayoutA,
-        Config::kAlignmentA,
-        Config::ElementB,
-        Config::LayoutB,
-        Config::kAlignmentB,
-        Config::ElementC,
-        Config::LayoutC,
-        Config::ElementAccumulator,
-        Config::OperatorClass,
-        Config::ArchTag,
-        Config::ThreadblockShape,
-        Config::WarpShape,
-        Config::InstructionShape,
-        DualScaleEpilogueOp,
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-        Config::kStages
+        Config::ElementA,                    // ElementA
+        Config::LayoutA,                      // LayoutA
+        Config::kAlignmentA,                  // kAlignmentA
+        Config::ElementB,                     // ElementB
+        Config::LayoutB,                      // LayoutB
+        Config::kAlignmentB,                  // kAlignmentB
+        Config::ElementC,                     // ElementC
+        Config::LayoutC,                      // LayoutC
+        Config::ElementAccumulator,           // ElementAccumulator
+        Config::OperatorClass,                // OperatorClass
+        Config::ArchTag,                      // ArchTag
+        Config::ThreadblockShape,             // ThreadblockShape
+        Config::WarpShape,                    // WarpShape
+        Config::InstructionShape,             // InstructionShape
+        DualScaleEpilogueOp,                  // EpilogueOutputOp
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,  // ThreadblockSwizzle
+        Config::kStages,                      // Stages
+        cutlass::gemm::kernel::GroupScheduleMode,  // GroupScheduleMode
+        cutlass::arch::OpMultiplyAdd          // Operator
     >::GemmKernel;
 
     // Grouped GEMM device interface

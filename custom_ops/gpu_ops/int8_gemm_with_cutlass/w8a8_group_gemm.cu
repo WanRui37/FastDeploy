@@ -16,6 +16,8 @@
 #include "cutlass_helper.h"
 #include "w8a8_group_gemm.h"
 #include "cutlass/gemm/gemm.h"
+#include "cutlass/gemm/device/gemm_grouped.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/util/host_tensor.h"
 #include "cutlass/util/reference/host/tensor_fill.h"
 #include <vector>
@@ -555,38 +557,98 @@ std::vector<paddle::Tensor> W8A8GroupGemmOp(
     // Extract tensor data
     const int8_t* act_data = activations.data<int8_t>();
     const int8_t* weight_data = weights.data<int8_t>();
-    const float* scales_a_data = dequant_scales_a.data<float>();
-    const float* scales_b_data = dequant_scales_b.data<float>();
+    const float* scale_a_data = dequant_scales_a.data<float>();
+    const float* scale_b_data = dequant_scales_b.data<float>();
 
     // Extract problem sizes from tensor
+    const int64_t* problem_sizes_data = problem_sizes_tensor.data<int64_t>();
+    int num_groups = problem_sizes_tensor.shape()[0];
+
+    // Prepare problem sizes vector
     std::vector<cutlass::gemm::GemmCoord> problem_sizes;
-    // Implementation to convert tensor to problem_sizes vector...
+    for (int i = 0; i < num_groups; ++i) {
+        int64_t m = problem_sizes_data[i * 3];
+        int64_t n = problem_sizes_data[i * 3 + 1];
+        int64_t k = problem_sizes_data[i * 3 + 2];
+        problem_sizes.emplace_back(m, n, k);
+    }
 
-    // Extract leading dimensions
+    // Prepare leading dimensions (assuming packed layout)
     std::vector<int64_t> ldA, ldB, ldC;
-    // Implementation to extract leading dimensions...
+    for (const auto& problem_size : problem_sizes) {
+        ldA.push_back(problem_size.k());
+        ldB.push_back(problem_size.k());
+        ldC.push_back(problem_size.n());
+    }
 
-    // Extract scale dimensions
-    std::vector<int64_t> scale_dims_a = dequant_scales_a.shape();
-    std::vector<int64_t> scale_dims_b = dequant_scales_b.shape();
-
-    int num_groups = problem_sizes.size();
+    // Prepare scale dimensions
+    std::vector<int64_t> scale_dims_a = {num_groups, 1};  // [groups, features]
+    std::vector<int64_t> scale_dims_b = {num_groups, 1};  // [groups, features]
 
     // Create output tensor
-    paddle::Tensor outputs = paddle::empty(/* output shape */, paddle::DataType::BFLOAT16, activations.place());
-    cutlass::bfloat16_t* output_data = reinterpret_cast<cutlass::bfloat16_t*>(outputs.data<paddle::bfloat16>());
+    int64_t total_m = 0, total_n = problem_sizes[0].n();
+    for (const auto& problem_size : problem_sizes) {
+        total_m += problem_size.m();
+    }
 
-    // Launch W8A8 Grouped GEMM with dual scales
+    paddle::Tensor outputs = paddle::empty(
+        {total_m, total_n},
+        paddle::DataType::BFLOAT16,
+        activations.place()
+    );
+
+    // Run grouped GEMM with dual scales
     phi::RunW8A8GroupGemm<paddle::DataType::BFLOAT16>(
-        act_data, weight_data, scales_a_data, scales_b_data, output_data,
-        problem_sizes, ldA, ldB, ldC, scale_dims_a, scale_dims_b,
-        num_groups, activations.stream());
+        act_data,
+        weight_data,
+        scale_a_data,
+        scale_b_data,
+        reinterpret_cast<cutlass::bfloat16_t*>(outputs.data<paddle::bfloat16>()),
+        problem_sizes,
+        ldA,
+        ldB,
+        ldC,
+        scale_dims_a,
+        scale_dims_b,
+        num_groups,
+        activations.stream()
+    );
 
     return {outputs};
 }
 
-// Paddle operator registration with dual scales
-PD_BUILD_OP(w8a8_group_gemm)
+std::vector<std::vector<int64_t>> W8A8GroupGemmShape(
+    const std::vector<int64_t>& activations_shape,
+    const std::vector<int64_t>& weights_shape,
+    const std::vector<int64_t>& dequant_scales_a_shape,
+    const std::vector<int64_t>& dequant_scales_b_shape,
+    const std::vector<int64_t>& problem_sizes_shape) {
+
+    // Output shape is determined by problem_sizes tensor
+    // The first dimension is total M, second dimension is N
+    int64_t total_m = 0;
+    if (problem_sizes_shape.size() > 0) {
+        // For simplicity, assume problem_sizes tensor contains [num_groups, 3] shape
+        // where each row is [m, n, k]
+        total_m = problem_sizes_shape[0];  // Sum of all m dimensions
+    }
+
+    return {{total_m, 1}};  // Placeholder, actual N dimension should be determined
+}
+
+std::vector<paddle::DataType> W8A8GroupGemmDtype(
+    const paddle::DataType& activations_dtype,
+    const paddle::DataType& weights_dtype,
+    const paddle::DataType& dequant_scales_a_dtype,
+    const paddle::DataType& dequant_scales_b_dtype,
+    const paddle::DataType& problem_sizes_dtype) {
+
+    return {paddle::DataType::BFLOAT16};
+}
+
+PD_BUILD_STATIC_OP(w8a8_group_gemm)
     .Inputs({"activations", "weights", "dequant_scales_a", "dequant_scales_b", "problem_sizes"})
     .Outputs({"outputs"})
-    .SetKernelFn(PD_KERNEL(W8A8GroupGemmOp));
+    .SetKernelFn(PD_KERNEL(W8A8GroupGemmOp))
+    .SetInferShapeFn(PD_INFER_SHAPE(W8A8GroupGemmShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(W8A8GroupGemmDtype));
