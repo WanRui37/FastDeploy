@@ -384,6 +384,8 @@ elif paddle.is_compiled_with_cuda():
         sources += ["gpu_ops/multi_head_latent_attention.cu"]
         # gemm_dequant
         sources += ["gpu_ops/int8_gemm_with_cutlass/gemm_dequant.cu"]
+        # w8a8_group_gemm
+        sources += ["gpu_ops/int8_gemm_with_cutlass/w8a8_group_gemm.cu"]
         # speculate_decoding
         sources += find_end_files("gpu_ops/speculate_decoding", ".cu")
         sources += find_end_files("gpu_ops/speculate_decoding", ".cc")
@@ -394,9 +396,6 @@ elif paddle.is_compiled_with_cuda():
         sources += find_end_files("gpu_ops/cutlass_kernels/w4a8_moe/", ".cu")
         sources += find_end_files("gpu_ops/moe/", ".cu")
         nvcc_compile_args += ["-Igpu_ops/moe"]
-        # moe int8*int8
-        os.system("python utils/auto_gen_w8a8_gemm_kernel.py")
-        sources += find_end_files("gpu_ops/w8a8_gemm", ".cu")
 
     if cc >= 89:
         # Running generate fp8 gemm codes.
