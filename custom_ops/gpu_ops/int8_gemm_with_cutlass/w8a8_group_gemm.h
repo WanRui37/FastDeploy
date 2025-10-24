@@ -21,37 +21,29 @@
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
-#include "w8a8_group_gemm_template.h"
 
-namespace phi {
-
-// W8A8 Grouped GEMM parameters structure with dual scales
 struct W8A8GroupGemmParams {
-    const int8_t* activations;          // W8: int8 activations
-    const int8_t* weights;              // A8: int8 weights
-    const float* dequant_scales_a;      // Dequantization scales for activations
-    const float* dequant_scales_b;      // Dequantization scales for weights
-    cutlass::bfloat16_t* outputs;       // BF16 output
-    int32_t* workspace;                 // Workspace for grouped GEMM
+    const int8_t* activations;
+    const int8_t* weights;
+    const float* dequant_scales_a;
+    const float* dequant_scales_b;
+    cutlass::bfloat16_t* outputs;
+    int32_t* workspace;
 
-    // Group information
     std::vector<cutlass::gemm::GemmCoord> problem_sizes;
     std::vector<int64_t> leading_dimensions_A;
     std::vector<int64_t> leading_dimensions_B;
     std::vector<int64_t> leading_dimensions_C;
 
-    // Scale dimensions
-    std::vector<int64_t> scale_dims_a;  // Dimensions for activation scales
-    std::vector<int64_t> scale_dims_b;  // Dimensions for weight scales
+    std::vector<int64_t> scale_dims_a;
+    std::vector<int64_t> scale_dims_b;
 
     int num_groups;
     cudaStream_t stream;
 };
 
-// W8A8 Grouped GEMM launcher class with dual-scale support
 class W8A8GroupGemmLauncher {
 public:
-    // Configuration for W8A8 GEMM with dual scales
     struct Config {
         using ElementA = int8_t;
         using LayoutA = cutlass::layout::RowMajor;
@@ -75,11 +67,9 @@ public:
         static const int kAlignmentB = 16;
         static const int kAlignmentC = 8;
 
-        // Epilogue configuration for dual-scale dequantization
         static const int kElementsPerAccess = kAlignmentC / cutlass::sizeof_bits<ElementC>::value;
     };
 
-    // Custom epilogue operator for dual-scale dequantization
     class DualScaleEpilogueOp {
     public:
         using ElementOutput = Config::ElementC;
@@ -110,7 +100,6 @@ public:
             ElementScale scale_a,
             ElementScale scale_b) const {
 
-            // Apply dual-scale dequantization: output = (accumulator * scale_a * scale_b)
             ElementCompute dequantized = ElementCompute(accumulator) * scale_a * scale_b;
             return ElementOutput(dequantized);
         }
@@ -124,42 +113,55 @@ public:
         }
     };
 
-    // Grouped GEMM kernel type - simplified template instantiation
     using GemmKernel = typename cutlass::gemm::kernel::DefaultW8A8GemmGrouped<
-        Config::ElementA,                    // ElementA
-        Config::LayoutA,                      // LayoutA
-        Config::kAlignmentA,                  // kAlignmentA
-        Config::ElementB,                     // ElementB
-        Config::LayoutB,                      // LayoutB
-        Config::kAlignmentB,                  // kAlignmentB
-        Config::ElementC,                     // ElementC
-        Config::LayoutC,                      // LayoutC
-        Config::ElementAccumulator,           // ElementAccumulator
-        Config::OperatorClass,                // OperatorClass
-        Config::ArchTag,                      // ArchTag
-        Config::ThreadblockShape,             // ThreadblockShape
-        Config::WarpShape,                    // WarpShape
-        Config::InstructionShape,             // InstructionShape
-        DualScaleEpilogueOp,                  // EpilogueOutputOp
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,  // ThreadblockSwizzle
-        Config::kStages,                      // Stages
-        cutlass::gemm::kernel::GroupScheduleMode,  // GroupScheduleMode
-        cutlass::arch::OpMultiplyAdd          // Operator
+        Config::ElementA,
+        Config::LayoutA,
+        Config::kAlignmentA,
+        Config::ElementB,
+        Config::LayoutB,
+        Config::kAlignmentB,
+        Config::ElementC,
+        Config::LayoutC,
+        Config::ElementAccumulator,
+        Config::OperatorClass,
+        Config::ArchTag,
+        Config::ThreadblockShape,
+        Config::WarpShape,
+        Config::InstructionShape,
+        DualScaleEpilogueOp,
+        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+        Config::kStages,
+        cutlass::gemm::kernel::GroupScheduleMode,
+        cutlass::arch::OpMultiplyAdd
     >::GemmKernel;
 
-    // Grouped GEMM device interface
     using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
-    // Launch W8A8 grouped GEMM with dual scales
     static cutlass::Status launch(
         const W8A8GroupGemmParams& params,
         int multi_processor_count);
 
-    // Get workspace size
     static size_t get_workspace_size(const W8A8GroupGemmParams& params);
 
-    // Helper function to validate scale dimensions
     static bool validate_scale_dims(const W8A8GroupGemmParams& params);
 };
 
-}  // namespace phi
+std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor& activations,
+                                          const paddle::Tensor& weights,
+                                          const paddle::Tensor& scales_a,
+                                          const paddle::Tensor& scales_b,
+                                          const paddle::Tensor& expert_offsets);
+
+std::vector<std::vector<int64_t>> W8A8GroupGemmShape(
+    const std::vector<int64_t>& activations_shape,
+    const std::vector<int64_t>& weights_shape,
+    const std::vector<int64_t>& scales_a_shape,
+    const std::vector<int64_t>& scales_b_shape,
+    const std::vector<int64_t>& expert_offsets_shape);
+
+std::vector<paddle::DataType> W8A8GroupGemmDtype(
+    const paddle::DataType& activations_dtype,
+    const paddle::DataType& weights_dtype,
+    const paddle::DataType& scales_a_dtype,
+    const paddle::DataType& scales_b_dtype,
+    const paddle::DataType& expert_offsets_dtype);
