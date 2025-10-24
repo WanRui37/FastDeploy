@@ -20,6 +20,7 @@ import paddle
 from paddleformers.utils.log import logger
 
 import fastdeploy
+from fastdeploy.model_executor.layers.moe import FusedMoE
 from fastdeploy.platforms.utils import convert_to_npu_dequant_scale
 
 from ..utils import get_tensor
@@ -58,7 +59,15 @@ class W8A8Config(QuantConfigBase):
         return cls(weight_scale_dict, act_scale_dict, use_gemm_dequant)
 
     def get_quant_method(self, layer) -> Optional[QuantMethodBase]:
-        return W8A8LinearMethod(self)
+        """ """
+        if isinstance(layer, FusedMoE):
+            from fastdeploy.model_executor.layers.moe.fused_moe_triton_backend import (
+                W8A8MoEMethod,
+            )
+
+            return W8A8MoEMethod(self)
+        else:
+            return W8A8LinearMethod(self)
 
 
 class W8A8LinearMethod(QuantMethodBase):

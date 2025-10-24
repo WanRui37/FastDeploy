@@ -158,7 +158,7 @@ void RunGemmDequant(const int8_t *a,
                     int n,
                     cudaStream_t stream) {
     using ElementA = int8_t;
-    using ElementB = int8_t;
+using ElementB = int8_t;
     using ElementC = typename CutlassDtypeTraits<D>::DataType;
     using ElementCompute = int32_t;
     using ElementD = ElementC;
@@ -408,12 +408,11 @@ size_t W8A8GroupGemmLauncher::get_workspace_size(const W8A8GroupGemmParams& para
     using GemmGrouped = W8A8GroupGemmLauncher::GemmGrouped;
     GemmGrouped gemm;
 
-    // Prepare arguments with dual-scale support
+    // Prepare arguments with dual-scale support - FIXED CONSTRUCTOR CALL
     typename GemmGrouped::Arguments args(
         params.problem_sizes.data(),
         params.num_groups,
         1,  // threadblock_count (will be computed by GEMM)
-        typename W8A8GroupGemmLauncher::DualScaleEpilogueOp::Params(1.0f, 0.0f),
         params.activations,
         params.weights,
         reinterpret_cast<const cutlass::bfloat16_t*>(params.outputs),
@@ -421,7 +420,8 @@ size_t W8A8GroupGemmLauncher::get_workspace_size(const W8A8GroupGemmParams& para
         params.leading_dimensions_A.data(),
         params.leading_dimensions_B.data(),
         params.leading_dimensions_C.data(),
-        params.leading_dimensions_C.data()
+        params.leading_dimensions_C.data(),
+        typename W8A8GroupGemmLauncher::DualScaleEpilogueOp::Params(1.0f, 0.0f)  // Moved epilogue params to end
     );
 
     return gemm.get_workspace_size(args);
@@ -457,12 +457,11 @@ cutlass::Status W8A8GroupGemmLauncher::launch(
     // Prepare epilogue operator with dual-scale dequantization
     typename W8A8GroupGemmLauncher::DualScaleEpilogueOp::Params epilogue_op(1.0f, 0.0f);
 
-    // Prepare GEMM arguments with dual-scale support
+    // Prepare GEMM arguments with dual-scale support - FIXED CONSTRUCTOR CALL
     typename GemmGrouped::Arguments args(
         params.problem_sizes.data(),
         params.num_groups,
         threadblock_count,
-        epilogue_op,
         params.activations,
         params.weights,
         reinterpret_cast<const cutlass::bfloat16_t*>(params.outputs), // C matrix
@@ -470,7 +469,8 @@ cutlass::Status W8A8GroupGemmLauncher::launch(
         params.leading_dimensions_A.data(),
         params.leading_dimensions_B.data(),
         params.leading_dimensions_C.data(),
-        params.leading_dimensions_C.data()
+        params.leading_dimensions_C.data(),
+        epilogue_op  // Moved epilogue params to end
     );
 
     // Initialize GEMM
