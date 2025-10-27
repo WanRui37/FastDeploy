@@ -21,147 +21,135 @@
 #include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/gemm.h"
 #include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/kernel/gemm_grouped.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
+#include "cutlass/tensor_ref.h"
+#include "cutlass/layout/matrix.h"
+#include "cutlass/arch/arch.h"
 
-struct W8A8GroupGemmParams {
-    const int8_t* activations;
-    const int8_t* weights;
-    const float* dequant_scales_a;
-    const float* dequant_scales_b;
-    cutlass::bfloat16_t* outputs;
-    int32_t* workspace;
+#include "paddle/phi/core/dense_tensor.h"
+#include "paddle/extension.h"
+#include "paddle/phi/api/include/context_pool.h"
+#include "paddle/phi/common/data_type.h"
+#include "paddle/phi/common/place.h"
+#include "paddle/phi/core/allocator.h"
+#include "paddle/common/flags.h"
 
-    std::vector<cutlass::gemm::GemmCoord> problem_sizes;
-    std::vector<int64_t> leading_dimensions_A;
-    std::vector<int64_t> leading_dimensions_B;
-    std::vector<int64_t> leading_dimensions_C;
+namespace cutlass {
 
-    std::vector<int64_t> scale_dims_a;
-    std::vector<int64_t> scale_dims_b;
+template <int M1, int N1, int K1, int M2, int N2, int K2,
+        typename ElementA_,
+        typename LayoutA_,
+        typename ElementB_,
+        typename LayoutB_,
+        typename ElementC_,
+        typename LayoutC_,
+        typename ElementAccumulator_,
+        typename ArchTag_,
+        int kStages_,
+        int kAlignmentAB_,
+        int kAlignmentC_>
+bool W8A8GroupGemmLauncher(const ElementA_* A,
+                        const ElementB_* B,
+                        ElementC_* C,
+                        const ElementAccumulator_* act_scales,
+                        const ElementAccumulator_* weight_scales,
+                        int lda, int ldb, int ldc, int ldd,
+                        int m, int n, int k,
+                        cudaStream_t stream) {
+    using ElementA = ElementA_;
+    using LayoutA = LayoutA_;
+    int kAlignmentA = kAlignmentAB_;
+    using ElementB = ElementB_;
+    using LayoutB = LayoutB_;
+    int kAlignmentB = kAlignmentAB_;
+    using ElementC = ElementC_;
+    using LayoutC = LayoutC_;
+    int kAlignmentC = kAlignmentC_;
+    using ElementAccumulator = ElementAccumulator_;
 
-    int num_groups;
-    cudaStream_t stream;
-};
+    using OperatorClass = cutlass::arch::OpClassTensorOp;
+    using ArchTag = ArchTag_;
 
-class W8A8GroupGemmLauncher {
-public:
-    struct Config {
-        using ElementA = int8_t;
-        using LayoutA = cutlass::layout::RowMajor;
-        using ElementB = int8_t;
-        using LayoutB = cutlass::layout::ColumnMajor;
-        using ElementC = cutlass::bfloat16_t;
-        using LayoutC = cutlass::layout::RowMajor;
-        using ElementAccumulator = int32_t;
-        using ElementCompute = float;
-        using ElementScale = float;
+    using ThreadblockShape = cutlass::gemm::GemmShape<M1, N1, K1>;
+    using WarpShape = cutlass::gemm::GemmShape<M2, N2, K2>;
+    using InstructionShape = cutlass::gemm::GemmShape<16, 8, 16>;
 
-        using OperatorClass = cutlass::arch::OpClassTensorOp;
-        using ArchTag = cutlass::arch::Sm80;
+    using EpilogueOutputOp = cutlass::epilogue::thread::LinearCombination<
+            ElementC, kAlignmentC, ElementAccumulator, ElementAccumulator>;
 
-        using ThreadblockShape = cutlass::gemm::GemmShape<128, 128, 64>;
-        using WarpShape = cutlass::gemm::GemmShape<64, 64, 64>;
-        using InstructionShape = cutlass::gemm::GemmShape<16, 8, 32>;
+    using ThreadblockSwizzle = cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle;
+    int kStages = kStages_;
 
-        static const int kStages = 3;
-        static const int kAlignmentA = 16;
-        static const int kAlignmentB = 16;
-        static const int kAlignmentC = 8;
-
-        static const int kElementsPerAccess = kAlignmentC / cutlass::sizeof_bits<ElementC>::value;
-    };
-
-    class DualScaleEpilogueOp {
-    public:
-        using ElementOutput = Config::ElementC;
-        using ElementAccumulator = Config::ElementAccumulator;
-        using ElementCompute = Config::ElementCompute;
-        using ElementScale = Config::ElementScale;
-
-        static int const kCount = Config::kElementsPerAccess;
-
-        struct Params {
-            ElementCompute alpha;
-            ElementCompute beta;
-
-            Params(ElementCompute alpha_ = ElementCompute(1),
-                   ElementCompute beta_ = ElementCompute(0))
-                : alpha(alpha_), beta(beta_) {}
-        };
-
-        Params params;
-
-        CUTLASS_HOST_DEVICE
-        DualScaleEpilogueOp(Params const& params_ = Params()) : params(params_) {}
-
-        CUTLASS_HOST_DEVICE
-        ElementOutput operator()(
-            ElementAccumulator accumulator,
-            ElementCompute linear_combination,
-            ElementScale scale_a,
-            ElementScale scale_b) const {
-
-            ElementCompute dequantized = ElementCompute(accumulator) * scale_a * scale_b;
-            return ElementOutput(dequantized);
-        }
-
-        CUTLASS_HOST_DEVICE
-        ElementOutput operator()(
-            ElementAccumulator accumulator,
-            ElementScale scale_a,
-            ElementScale scale_b) const {
-            return (*this)(accumulator, ElementCompute(1), scale_a, scale_b);
-        }
-    };
-
-    using GemmKernel = typename cutlass::gemm::kernel::DefaultW8A8GemmGrouped<
-        Config::ElementA,
-        Config::LayoutA,
-        Config::kAlignmentA,
-        Config::ElementB,
-        Config::LayoutB,
-        Config::kAlignmentB,
-        Config::ElementC,
-        Config::LayoutC,
-        Config::ElementAccumulator,
-        Config::OperatorClass,
-        Config::ArchTag,
-        Config::ThreadblockShape,
-        Config::WarpShape,
-        Config::InstructionShape,
-        DualScaleEpilogueOp,
-        cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-        Config::kStages,
-        cutlass::gemm::kernel::GroupScheduleMode,
-        cutlass::arch::OpMultiplyAdd
-    >::GemmKernel;
+    using GemmKernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+        ElementA,
+        LayoutA,
+        cutlass::ComplexTransform::kNone,
+        kAlignmentA,
+        ElementB,
+        LayoutB,
+        cutlass::ComplexTransform::kNone,
+        kAlignmentB,
+        ElementC,
+        LayoutC,
+        ElementAccumulator,
+        OperatorClass,
+        ArchTag,
+        ThreadblockShape,
+        WarpShape,
+        InstructionShape,
+        EpilogueOutputOp,
+        ThreadblockSwizzle,
+        kStages,
+        cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly>::GemmKernel;
 
     using GemmGrouped = cutlass::gemm::device::GemmGrouped<GemmKernel>;
 
-    static cutlass::Status launch(
-        const W8A8GroupGemmParams& params,
-        int multi_processor_count);
+    typename GemmGrouped::EpilogueOp::Params epilogue_op(ElementAccumulator(1.f),
+                                            ElementAccumulator(0.f));
+    // Create problem sizes
+    cutlass::gemm::GemmCoord problem_sizes(m, n, k);
+    int problem_count = problem_sizes.size();
+    int threadblock_count = GemmGrouped::sufficient(problem_sizes.data(), problem_count);
 
-    static size_t get_workspace_size(const W8A8GroupGemmParams& params);
+    // Create arguments
+    typename GemmGrouped::Arguments args(
+        problem_sizes_device,
+        problem_count,
+        threadblock_count,
+        reinterpret_cast<const ElementA*>(A),
+        reinterpret_cast<const ElementB*>(B),
+        reinterpret_cast<ElementC*>(C),
+        reinterpret_cast<ElementC*>(C),
+        lda,
+        ldb,
+        ldc,
+        ldd,
+        problem_sizes
+    );
 
-    static bool validate_scale_dims(const W8A8GroupGemmParams& params);
+    GemmGrouped gemm_op;
+
+    size_t workspace_size = gemm_op.get_workspace_size(args);
+    cutlass::DeviceAllocation<uint8_t> workspace(workspace_size);
+
+    Status init_status = gemm_op.initialize(args, workspace.get());
+    if (init_status != cutlass::Status::kSuccess) {
+        std::string err_msg =
+            "Failed to initialize cutlass variable batched gemm. Error: " +
+            std::string(cutlassGetStatusString(init_status));
+        throw std::runtime_error("[W8A8GroupGemm Runner] " + err_msg);
+    }
+
+    auto run_status = gemm_op.run(stream);
+    if (run_status != cutlass::Status::kSuccess) {
+        std::string err_msg =
+            "Failed to run cutlass variable batched gemm. Error: " +
+            std::string(cutlassGetStatusString(run_status));
+        throw std::runtime_error("[W8A8GroupGemm Runner] " + err_msg);
+}
+
+    return true;
 };
 
-std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor& activations,
-                                          const paddle::Tensor& weights,
-                                          const paddle::Tensor& scales_a,
-                                          const paddle::Tensor& scales_b,
-                                          const paddle::Tensor& expert_offsets);
-
-std::vector<std::vector<int64_t>> W8A8GroupGemmShape(
-    const std::vector<int64_t>& activations_shape,
-    const std::vector<int64_t>& weights_shape,
-    const std::vector<int64_t>& scales_a_shape,
-    const std::vector<int64_t>& scales_b_shape,
-    const std::vector<int64_t>& expert_offsets_shape);
-
-std::vector<paddle::DataType> W8A8GroupGemmDtype(
-    const paddle::DataType& activations_dtype,
-    const paddle::DataType& weights_dtype,
-    const paddle::DataType& scales_a_dtype,
-    const paddle::DataType& scales_b_dtype,
-    const paddle::DataType& expert_offsets_dtype);
+} // namespace cutlass

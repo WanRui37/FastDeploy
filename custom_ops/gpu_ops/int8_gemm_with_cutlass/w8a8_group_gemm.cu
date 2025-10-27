@@ -13,159 +13,155 @@
 // limitations under the License.
 
 #include "w8a8_group_gemm.h"
-#include "cutlass/gemm/gemm.h"
 #include "cutlass/gemm/device/gemm_grouped.h"
-#include "cutlass/gemm/kernel/default_gemm_grouped.h"
+#include "cutlass/gemm/kernel/gemm_grouped.h"
 #include "cutlass/util/host_tensor.h"
-#include "cutlass/util/reference/host/tensor_fill.h"
-#include "cutlass_extensions/epilogue/scaled_mm_epilogues_c3x.hpp"
-#include "get_group_starts.cuh"
+#include "cutlass/util/reference/device/tensor_fill.h"
+#include <cuda_runtime.h>
+#include <cstdint>
 #include <vector>
+#include <iostream>
 #include <algorithm>
 
-cutlass::Status W8A8GroupGemmLauncher::launch(
-    const W8A8GroupGemmParams& params,
-    int multi_processor_count) {
+// Helper template for dtype conversion
+template<paddle::DataType D>
+struct CutlassDtypeTraits;
 
-    // Validate scale dimensions
-    if (!validate_scale_dims(params)) {
-        return cutlass::Status::kErrorInvalidProblem;
-    }
+template<>
+struct CutlassDtypeTraits<paddle::DataType::BFLOAT16> {
+    using DataType = cutlass::bfloat16_t;
+};
 
-    // Create grouped GEMM device interface
-    GemmGrouped gemm_grouped;
+template<>
+struct CutlassDtypeTraits<paddle::DataType::FLOAT16> {
+    using DataType = cutlass::half_t;
+};
 
-    // Prepare arguments for grouped GEMM
-    typename GemmGrouped::Arguments args;
-    args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
-    args.problem_count = params.num_groups;
-    args.problem_sizes = params.problem_sizes.data();
-    args.lda = params.leading_dimensions_A.data();
-    args.ldb = params.leading_dimensions_B.data();
-    args.ldc = params.leading_dimensions_C.data();
-    args.ldd = params.leading_dimensions_C.data();
-
-    // Set pointers
-    args.A = const_cast<int8_t*>(params.activations);
-    args.B = const_cast<int8_t*>(params.weights);
-    args.C = nullptr;  // No initial C matrix
-    args.D = params.outputs;
-
-    // Set scales for dual-scale dequantization
-    args.alpha = 1.0f;
-    args.beta = 0.0f;
-
-    // Set stream
-    args.stream = params.stream;
-
-    // Initialize the operation
-    cutlass::Status status = gemm_grouped.initialize(args, params.workspace);
-    if (status != cutlass::Status::kSuccess) {
-        return status;
-    }
-
-    // Run the operation
-    return gemm_grouped.run();
-}
-
-size_t W8A8GroupGemmLauncher::get_workspace_size(const W8A8GroupGemmParams& params) {
-    GemmGrouped gemm_grouped;
-    typename GemmGrouped::Arguments args;
-    args.mode = cutlass::gemm::GemmUniversalMode::kGrouped;
-    args.problem_count = params.num_groups;
-    args.problem_sizes = params.problem_sizes.data();
-    args.lda = params.leading_dimensions_A.data();
-    args.ldb = params.leading_dimensions_B.data();
-    args.ldc = params.leading_dimensions_C.data();
-    args.ldd = params.leading_dimensions_C.data();
-
-    return gemm_grouped.get_workspace_size(args);
-}
-
-bool W8A8GroupGemmLauncher::validate_scale_dims(const W8A8GroupGemmParams& params) {
-    // Validate activation scales dimensions
-    if (params.scale_dims_a.size() != 1 && params.scale_dims_a.size() != params.num_groups) {
-        return false;
-    }
-
-    // Validate weight scales dimensions
-    if (params.scale_dims_b.size() != 1 && params.scale_dims_b.size() != params.num_groups) {
-        return false;
-    }
-
-    return true;
-}
+template<>
+struct CutlassDtypeTraits<paddle::DataType::FLOAT32> {
+    using DataType = float;
+};
 
 // Paddle operator implementation
-std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor& activations,
-                                          const paddle::Tensor& weights,
-                                          const paddle::Tensor& scales_a,
-                                          const paddle::Tensor& scales_b,
-                                          const paddle::Tensor& expert_offsets) {
-    // Validate input tensors
-    PADDLE_ENFORCE_EQ(activations.dtype(), paddle::DataType::INT8,
-                     phi::errors::InvalidArgument("Activations must be int8"));
-    PADDLE_ENFORCE_EQ(weights.dtype(), paddle::DataType::INT8,
-                     phi::errors::InvalidArgument("Weights must be int8"));
-    PADDLE_ENFORCE_EQ(scales_a.dtype(), paddle::DataType::FLOAT32,
-                     phi::errors::InvalidArgument("Scales A must be float32"));
-    PADDLE_ENFORCE_EQ(scales_b.dtype(), paddle::DataType::FLOAT32,
-                     phi::errors::InvalidArgument("Scales B must be float32"));
-    PADDLE_ENFORCE_EQ(expert_offsets.dtype(), paddle::DataType::INT64,
-                     phi::errors::InvalidArgument("Expert offsets must be int64"));
+template <paddle::DataType D, typename T>
+void RunW8A8GroupGemm(const int8_t *activations,
+                    const int8_t *weights,
+                    T *output,
+                    const float *scales_a,
+                    const float *scales_b,
+                    int lda, int ldb, int ldc, int ldd,
+                    int m,
+                    int k,
+                    int n,
+                    cudaStream_t stream) {
 
     // Get dimensions
-    auto activations_shape = activations.shape();
-    auto weights_shape = weights.shape();
-    auto scales_a_shape = scales_a.shape();
-    auto scales_b_shape = scales_b.shape();
-    auto expert_offsets_shape = expert_offsets.shape();
+    using ElementA = int8_t;
+    using LayoutA = cutlass::layout::RowMajor;
+    using ElementB = int8_t;
+    using LayoutB = cutlass::layout::ColumnMajor;
+    using ElementC = typename CutlassDtypeTraits<D>::DataType;
+    using LayoutC = cutlass::layout::RowMajor;
+    using ElementAccumulator = float;
+    using ArchTag = cutlass::arch::Sm80;
 
-    int num_experts = expert_offsets_shape[0];
-    int m = activations_shape[0];  // batch size
-    int k = activations_shape[1];  // input dimension
-    int n = weights_shape[0];     // output dimension
+    static int const kStages = 5;
+    static int const kAlignmentAB = 128 / cutlass::sizeof_bits<ElementA>::value;
+    static int const kAlignmentC = 128 / cutlass::sizeof_bits<ElementC>::value;
 
-    // Create output tensor
-    paddle::Tensor outputs = paddle::empty({m, n}, paddle::DataType::BFLOAT16, activations.place());
+    int M1 = 64, N1 = 64, K1 = 64, M2 = 32, N2 = 32, K2 = 64;
 
-    // Prepare parameters
-    W8A8GroupGemmParams params;
-    params.activations = activations.data<int8_t>();
-    params.weights = weights.data<int8_t>();
-    params.dequant_scales_a = scales_a.data<float>();
-    params.dequant_scales_b = scales_b.data<float>();
-    params.outputs = reinterpret_cast<cutlass::bfloat16_t*>(outputs.data<paddle::bfloat16>());
-    params.num_groups = num_experts;
-    params.stream = activations.stream();
+    // Call the launcher function directly
+    bool success = cutlass::W8A8GroupGemmLauncher<M1, N1, K1, M2, N2, K2,
+                                    ElementA,
+                                    LayoutA,
+                                    ElementB,
+                                    LayoutB,
+                                    ElementC,
+                                    LayoutC,
+                                    ElementAccumulator,
+                                    ArchTag,
+                                    kStages,
+                                    kAlignmentAB,
+                                    kAlignmentC>(
+        activations,
+        weights,
+        reinterpret_cast<ElementC*>(output),
+        scales_a,
+        scales_b,
+        lda, ldb, ldc, ldd,
+        m, n, k,
+        stream);
 
-    // Prepare problem sizes and leading dimensions
-    for (int i = 0; i < num_experts; ++i) {
-        params.problem_sizes.push_back(cutlass::gemm::GemmCoord(m, n, k));
-        params.leading_dimensions_A.push_back(k);
-        params.leading_dimensions_B.push_back(k);
-        params.leading_dimensions_C.push_back(n);
+    PADDLE_ENFORCE_EQ(success, true,
+                     phi::errors::Fatal("cutlass W8A8GroupGemm runtime error"));
+}
+
+std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor &activations,
+                                        const paddle::Tensor& weights,
+                                        const paddle::Tensor& scales_a,
+                                        const paddle::Tensor& scales_b,
+                                        const std::string &out_dtype) {
+    std::vector<int64_t> activations_dims = activations.shape(), weights_dims = weights.shape();
+    PADDLE_ENFORCE_EQ(
+        activations_dims[activations_dims.size() - 1],
+        weights_dims[weights_dims.size() - 1],
+        phi::errors::InvalidArgument(
+            "The last dimension of activations and weights should be equal. But "
+            "received activations[%d] != weights[%d].",
+            activations_dims[activations_dims.size() - 1],
+            weights_dims[weights_dims.size() - 1]));
+
+    int64_t m = activations_dims[activations_dims.size() - 2];
+    int64_t k = activations_dims[activations_dims.size() - 1];
+    int64_t n = weights_dims[weights_dims.size() - 2];
+
+    int64_t rank = activations.size();
+    int64_t lda = activations.dims()[rank - 1];
+    int64_t ldb = weights.dims()[rank - 1];
+    int64_t ldc = 0;
+    int64_t ldd = weights.dims()[rank - 1];
+
+    if (out_dtype == "bfloat16") {
+        paddle::Tensor out =
+            paddle::empty({m, n}, paddle::DataType::BFLOAT16, activations.place());
+        RunW8A8GroupGemm<paddle::DataType::BFLOAT16, paddle::bfloat16>(
+            activations.data<int8_t>(),
+            weights.data<int8_t>(),
+            out.data<paddle::bfloat16>(),
+            scales_a.data<float>(),
+            scales_b.data<float>(),
+            m, k, n,
+            activations.stream());
+        return {out};
+    } else if (out_dtype == "float16") {
+        paddle::Tensor out =
+            paddle::empty({m, n}, paddle::DataType::FLOAT16, activations.place());
+        RunW8A8GroupGemm<paddle::DataType::FLOAT16, paddle::float16>(
+            activations.data<int8_t>(),
+            weights.data<int8_t>(),
+            out.data<paddle::float16>(),
+            scales_a.data<float>(),
+            scales_b.data<float>(),
+            m, k, n,
+            activations.stream());
+        return {out};
+    } else if (out_dtype == "float32") {
+        paddle::Tensor out =
+            paddle::empty({m, n}, paddle::DataType::FLOAT32, activations.place());
+        RunW8A8GroupGemm<paddle::DataType::FLOAT32, paddle::float32>(
+            activations.data<int8_t>(),
+            weights.data<int8_t>(),
+            out.data<paddle::float32>(),
+            scales_a.data<float>(),
+            scales_b.data<float>(),
+            m, k, n,
+            activations.stream());
+        return {out};
+    } else {
+        PADDLE_THROW(phi::errors::InvalidArgument(
+            "only support bfloat16, float16, float32, but got %s", out_dtype));
     }
-
-    // Prepare scale dimensions
-    params.scale_dims_a = {scales_a_shape[0]};
-    params.scale_dims_b = {scales_b_shape[0]};
-
-    // Get workspace size and allocate
-    size_t workspace_size = W8A8GroupGemmLauncher::get_workspace_size(params);
-    paddle::Tensor workspace = paddle::empty({static_cast<int64_t>(workspace_size)},
-                                            paddle::DataType::INT32, activations.place());
-    params.workspace = workspace.data<int32_t>();
-
-    // Launch the operation
-    int multi_processor_count = 0;
-    cudaDeviceGetAttribute(&multi_processor_count, cudaDevAttrMultiProcessorCount, activations.device().index());
-
-    cutlass::Status status = W8A8GroupGemmLauncher::launch(params, multi_processor_count);
-    PADDLE_ENFORCE_EQ(status, cutlass::Status::kSuccess,
-                     phi::errors::Fatal("W8A8 grouped GEMM launch failed"));
-
-    return {outputs};
 }
 
 std::vector<std::vector<int64_t>> W8A8GroupGemmShape(
@@ -196,10 +192,10 @@ std::vector<paddle::DataType> W8A8GroupGemmDtype(
     return {paddle::DataType::BFLOAT16};
 }
 
-// PD_KERNEL binding similar to gemm_dequant.cu
+// PD_KERNEL binding
 PD_BUILD_STATIC_OP(w8a8_group_gemm)
     .Inputs({"activations", "weights", "scales_a", "scales_b", "expert_offsets"})
     .Outputs({"outputs"})
-    .SetKernelFn(PD_KERNEL(phi::W8A8GroupGemm))
-    .SetInferShapeFn(PD_INFER_SHAPE(phi::W8A8GroupGemmShape))
-    .SetInferDtypeFn(PD_INFER_DTYPE(phi::W8A8GroupGemmDtype));
+    .SetKernelFn(PD_KERNEL(W8A8GroupGemm))
+    .SetInferShapeFn(PD_INFER_SHAPE(W8A8GroupGemmShape))
+    .SetInferDtypeFn(PD_INFER_DTYPE(W8A8GroupGemmDtype));
