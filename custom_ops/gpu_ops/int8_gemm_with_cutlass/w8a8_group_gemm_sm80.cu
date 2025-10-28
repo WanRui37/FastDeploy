@@ -21,9 +21,9 @@
 #include <algorithm>
 
 // Paddle operator implementation
-template <paddle::DataType D, typename T>
-void RunW8A8GroupGemm(const int8_t *activations,
-                    const int8_t *weights,
+template <typename Input_type, paddle::DataType D, typename T>
+void RunW8A8GroupGemm(const Input_type *activations,
+                    const Input_type *weights,
                     T *output,
                     const float *scales_a,
                     const float *scales_b,
@@ -34,14 +34,14 @@ void RunW8A8GroupGemm(const int8_t *activations,
                     cudaStream_t stream) {
 
     // Get dimensions
-    using ElementA = int8_t;
+    using ElementA = Input_type;
     using LayoutA = cutlass::layout::RowMajor;
-    using ElementB = int8_t;
+    using ElementB = Input_type;
     using LayoutB = cutlass::layout::ColumnMajor;
-    using ElementC = typename CutlassDtypeTraits<D>::DataType;
+    using ElementC = T;
     using LayoutC = cutlass::layout::RowMajor;
     using ElementAccumulator = float;
-    using ArchTag = cutlass::arch::Sm89;
+    using ArchTag = cutlass::arch::Sm80;
 
     static constexpr int kStages = 5;  // 确保是constexpr
     static constexpr int kAlignmentAB = 128 / cutlass::sizeof_bits<ElementA>::value;  // 确保是constexpr
@@ -103,10 +103,10 @@ std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor &activations,
     if (out_dtype == "bfloat16") {
         paddle::Tensor out =
             paddle::empty({m, n}, paddle::DataType::BFLOAT16, activations.place());
-        RunW8A8GroupGemm<paddle::DataType::BFLOAT16, paddle::bfloat16>(
-            activations.data<int8_t>(),
-            weights.data<int8_t>(),
-            out.data<paddle::bfloat16>(),
+        RunW8A8GroupGemm<cutlass::half_t, paddle::DataType::BFLOAT16, cutlass::half_t>(
+            activations.data<cutlass::half_t>(),
+            weights.data<cutlass::half_t>(),
+            out.data<cutlass::half_t>(),
             scales_a.data<float>(),
             scales_b.data<float>(),
             lda, ldb, ldc, ldd,
@@ -116,10 +116,10 @@ std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor &activations,
     } else if (out_dtype == "float16") {
         paddle::Tensor out =
             paddle::empty({m, n}, paddle::DataType::FLOAT16, activations.place());
-        RunW8A8GroupGemm<paddle::DataType::FLOAT16, paddle::float16>(
-            activations.data<int8_t>(),
-            weights.data<int8_t>(),
-            out.data<paddle::float16>(),
+        RunW8A8GroupGemm<cutlass::half_t, paddle::DataType::FLOAT16, cutlass::half_t>(
+            activations.data<cutlass::half_t>(),
+            weights.data<cutlass::half_t>(),
+            out.data<cutlass::half_t>(),
             scales_a.data<float>(),
             scales_b.data<float>(),
             lda, ldb, ldc, ldd,
