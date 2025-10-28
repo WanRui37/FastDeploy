@@ -103,9 +103,9 @@ std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor &activations,
     if (out_dtype == "bfloat16") {
         paddle::Tensor out =
             paddle::empty({m, n}, paddle::DataType::BFLOAT16, activations.place());
-        RunW8A8GroupGemm<cutlass::half_t, paddle::DataType::BFLOAT16, cutlass::half_t>(
-            activations.data<cutlass::half_t>(),
-            weights.data<cutlass::half_t>(),
+        RunW8A8GroupGemm<cutlass::int8_t, paddle::DataType::BFLOAT16, cutlass::half_t>(
+            activations.data<cutlass::int8_t>(),
+            weights.data<cutlass::int8_t>(),
             out.data<cutlass::half_t>(),
             scales_a.data<float>(),
             scales_b.data<float>(),
@@ -116,9 +116,9 @@ std::vector<paddle::Tensor> W8A8GroupGemm(const paddle::Tensor &activations,
     } else if (out_dtype == "float16") {
         paddle::Tensor out =
             paddle::empty({m, n}, paddle::DataType::FLOAT16, activations.place());
-        RunW8A8GroupGemm<cutlass::half_t, paddle::DataType::FLOAT16, cutlass::half_t>(
-            activations.data<cutlass::half_t>(),
-            weights.data<cutlass::half_t>(),
+        RunW8A8GroupGemm<cutlass::int8_t, paddle::DataType::FLOAT16, cutlass::half_t>(
+            activations.data<cutlass::int8_t>(),
+            weights.data<cutlass::int8_t>(),
             out.data<cutlass::half_t>(),
             scales_a.data<float>(),
             scales_b.data<float>(),
