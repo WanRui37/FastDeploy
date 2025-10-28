@@ -15,6 +15,9 @@
 #include "gemm_dequant.h"
 #include "cutlass_helper.h"
 
+#include "paddle/extension.h"
+#include "paddle/phi/core/kernel_registry.h"
+
 template <typename Type, int CtaM, int CtaN, int Threads>
 __global__ void int8_sq(int8_t const* act,
                           int8_t const* weight,
