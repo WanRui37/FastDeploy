@@ -32,7 +32,10 @@ try:
 except ImportError:
     pass
 from fastdeploy.model_executor.layers.moe.moe import get_moe_scores
-from fastdeploy.model_executor.layers.quantization.ops import scaled_fp8_quant
+from fastdeploy.model_executor.layers.quantization.ops import (
+    scaled_fp8_quant,
+    scaled_int8_quant,
+)
 
 
 class TritonWeightOnlyMoEMethod(QuantMethodBase):
@@ -333,6 +336,7 @@ class TritonWeightOnlyMoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=False,
             use_int8_w8a16=True,
+            use_int8_w8a8=False,
             per_channel_quant=False,
             even_Ks=hidden_size % config["BLOCK_SIZE_K"] == 0,
         )
@@ -386,6 +390,7 @@ class TritonWeightOnlyMoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=False,
             use_int8_w8a16=True,
+            use_int8_w8a8=False,
             per_channel_quant=False,
             even_Ks=moe_intermediate_size % config["BLOCK_SIZE_K"] == 0,
         )
@@ -702,6 +707,7 @@ class Wfp8Afp8MoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=True,
             use_int8_w8a16=False,
+            use_int8_w8a8=False,
             per_channel_quant=True,
             even_Ks=hidden_size % config["BLOCK_SIZE_K"] == 0,
         )
@@ -758,6 +764,7 @@ class Wfp8Afp8MoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=True,
             use_int8_w8a16=False,
+            use_int8_w8a8=False,
             per_channel_quant=True,
             even_Ks=moe_intermediate_size % config["BLOCK_SIZE_K"] == 0,
         )
@@ -977,6 +984,7 @@ class TensorWiseFP8MoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=True,
             use_int8_w8a16=False,
+            use_int8_w8a8=False,
             per_channel_quant=False,
             even_Ks=hidden_size % config_up_gate_proj["BLOCK_SIZE_K"] == 0,
         )
@@ -1047,6 +1055,7 @@ class TensorWiseFP8MoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=True,
             use_int8_w8a16=False,
+            use_int8_w8a8=False,
             per_channel_quant=False,
             even_Ks=moe_intermediate_size % config_down_proj["BLOCK_SIZE_K"] == 0,
         )
@@ -1397,6 +1406,7 @@ class BlockWiseFP8MoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=True,
             use_int8_w8a16=False,
+            use_int8_w8a8=False,
             per_channel_quant=False,
             even_Ks=hidden_size % config["BLOCK_SIZE_K"] == 0,
         )
@@ -1451,12 +1461,311 @@ class BlockWiseFP8MoEMethod(QuantMethodBase):
             compute_type_enum=1,
             use_fp8_w8a8=True,
             use_int8_w8a16=False,
+            use_int8_w8a8=False,
             per_channel_quant=False,
             even_Ks=moe_intermediate_size % config["BLOCK_SIZE_K"] == 0,
         )
 
         intermediate_cache3.reshape_([token_num, top_k, hidden_size])
         out = intermediate_cache3.sum(axis=1)
+
+        if layer.tp_size > 1:
+            tensor_model_parallel_all_reduce(out)
+
+        return out
+
+
+class W8A8MoEMethod(QuantMethodBase):
+    """
+    Use Triton Group Gemm to compute Fused w8a8 Quant MoE.
+    """
+
+    def __init__(self, quant_config):
+        """
+        Triton Group Gemm to compute Fused MoE.
+        """
+        self.quant_config = quant_config
+        self.added_weight_attrs = ["up_gate_proj_weight", "down_proj_weight"]
+        self.added_scale_attrs = [
+            "up_gate_proj_weight_scale",
+            "down_proj_weight_scale",
+        ]
+
+    def process_prequanted_weights(self, layer: nn.Layer, state_dict, is_rearrange: bool = False) -> None:
+        """process_prequanted_weights"""
+        raise NotImplementedError
+
+    def create_weights(self, layer: nn.Layer, **extra_weight_attrs):
+        """
+        Triton MoE create weight process.
+        """
+        self.up_gate_proj_weight_shape = [
+            layer.num_local_experts,
+            layer.moe_intermediate_size * 2,
+            layer.hidden_size,
+        ]
+        self.down_proj_weight_shape = [
+            layer.num_local_experts,
+            layer.hidden_size,
+            layer.moe_intermediate_size,
+        ]
+        self.up_gate_proj_scale_shape = [
+            layer.num_local_experts,
+            layer.moe_intermediate_size * 2,
+            1,
+        ]
+        self.down_proj_scale_shape = [
+            layer.num_local_experts,
+            layer.hidden_size,
+            1,
+        ]
+
+        self.weight_dtype = "int8"
+        up_gate_proj_weight_name = self.added_weight_attrs[0]
+        down_proj_weight_name = self.added_weight_attrs[1]
+        up_gate_proj_scale_name = self.added_scale_attrs[0]
+        down_proj_scale_name = self.added_scale_attrs[1]
+
+        setattr(
+            layer,
+            up_gate_proj_weight_name,
+            layer.create_parameter(
+                shape=self.up_gate_proj_weight_shape,
+                dtype=self.weight_dtype,
+                default_initializer=paddle.nn.initializer.Constant(0),
+            ),
+        )
+        setattr(
+            layer,
+            down_proj_weight_name,
+            layer.create_parameter(
+                shape=self.down_proj_weight_shape,
+                dtype=self.weight_dtype,
+                default_initializer=paddle.nn.initializer.Constant(0),
+            ),
+        )
+        setattr(
+            layer,
+            up_gate_proj_scale_name,
+            layer.create_parameter(
+                shape=self.up_gate_proj_scale_shape,
+                dtype="float32",
+                default_initializer=paddle.nn.initializer.Constant(0),
+            ),
+        )
+        setattr(
+            layer,
+            down_proj_scale_name,
+            layer.create_parameter(
+                shape=self.down_proj_scale_shape,
+                dtype="float32",
+                default_initializer=paddle.nn.initializer.Constant(0),
+            ),
+        )
+
+    def process_loaded_weights(self, layer: nn.Layer, state_dict):
+        """
+        Triton MoE load weight process.
+        """
+        up_gate_proj_weights, down_proj_weights, _, _ = layer.extract_moe_ffn_weights(state_dict)
+        assert len(up_gate_proj_weights) == layer.num_local_experts
+        assert len(down_proj_weights) == layer.num_local_experts
+
+        assert up_gate_proj_weights[0].shape == [
+            layer.hidden_size,
+            layer.moe_intermediate_size * 2,
+        ]
+        assert down_proj_weights[0].shape == [
+            layer.moe_intermediate_size,
+            layer.hidden_size,
+        ]
+
+        up_gate_proj_tensor = paddle.stack(up_gate_proj_weights, axis=0)
+        down_proj_tensor = paddle.stack(down_proj_weights, axis=0)
+
+        max_bound = 127.0
+
+        # Process up_gate_proj weights
+        up_gate_proj_tensor = up_gate_proj_tensor.transpose([0, 2, 1])  # [E, N, K] -> [E, K, N]
+        up_gate_proj_scale = up_gate_proj_tensor.abs().max(axis=2, keepdim=True)  # [E, K, 1]
+        up_gate_proj_quant = up_gate_proj_tensor / up_gate_proj_scale * max_bound
+        up_gate_proj_quant = paddle.round(up_gate_proj_quant).astype("int8")
+        up_gate_proj_scale = up_gate_proj_scale / max_bound
+
+        # Process down_proj weights
+        down_proj_tensor = down_proj_tensor.transpose([0, 2, 1])  # [E, N, K] -> [E, K, N]
+        down_proj_scale = down_proj_tensor.abs().max(axis=2, keepdim=True)  # [E, K, 1]
+        down_proj_quant = down_proj_tensor / down_proj_scale * max_bound
+        down_proj_quant = paddle.round(down_proj_quant).astype("int8")
+        down_proj_scale = down_proj_scale / max_bound
+
+        getattr(layer, self.added_weight_attrs[0]).set_value(up_gate_proj_quant)
+        getattr(layer, self.added_scale_attrs[0]).set_value(up_gate_proj_scale)
+        getattr(layer, self.added_weight_attrs[1]).set_value(down_proj_quant)
+        getattr(layer, self.added_scale_attrs[1]).set_value(down_proj_scale)
+
+    def apply(
+        self,
+        layer: nn.Layer,
+        x: paddle.Tensor,
+        gate: nn.Layer,
+    ) -> paddle.Tensor:
+        """
+        Triton compute Fused MoE.
+        """
+
+        gate_out = gate(x.cast("float32"))
+        token_num = x.shape[0]
+        top_k = layer.top_k
+        num_local_experts = layer.num_local_experts
+        moe_intermediate_size = layer.moe_intermediate_size
+        hidden_size = layer.hidden_size
+
+        topk_ids, topk_weights = fastdeploy.model_executor.ops.gpu.moe_topk_select(
+            gate_out,
+            layer.gate_correction_bias,
+            top_k,
+            True,  # apply_norm_weight
+            False,
+        )
+
+        up_gate_proj_out = paddle.empty(
+            [token_num * top_k, moe_intermediate_size * 2],
+            dtype=x.dtype,
+        )
+
+        config_up_gate_proj = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 256,
+            "GROUP_SIZE_M": 1,
+        }
+
+        sorted_token_ids, expert_ids, num_tokens_post_padded = tritonmoe_preprocess_func(
+            topk_ids, num_local_experts, config_up_gate_proj["BLOCK_SIZE_M"]
+        )
+        max_possible_num_post_padded = sorted_token_ids.shape[0]
+        grid = (
+            ceil_div(
+                max_possible_num_post_padded,
+                config_up_gate_proj["BLOCK_SIZE_M"],
+            )
+            * ceil_div(moe_intermediate_size * 2, config_up_gate_proj["BLOCK_SIZE_N"]),
+        )
+
+        from .triton_moe_kernels import fused_moe_kernel_paddle
+
+        x_q, x_scale = scaled_int8_quant(x, use_per_token_if_dynamic=True)
+
+        fused_moe_kernel_paddle[grid](
+            x_q,
+            layer.up_gate_proj_weight,
+            up_gate_proj_out,
+            x_scale,
+            layer.up_gate_proj_weight_scale,
+            None,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            max_possible_num_post_padded,
+            token_num * top_k,
+            N=moe_intermediate_size * 2,
+            K=hidden_size,
+            stride_am=x.strides[0],
+            stride_ak=x.strides[1],
+            stride_be=layer.up_gate_proj_weight.strides[0],
+            stride_bk=layer.up_gate_proj_weight.strides[1],
+            stride_bn=layer.up_gate_proj_weight.strides[2],
+            stride_cm=up_gate_proj_out.strides[0],
+            stride_cn=up_gate_proj_out.strides[1],
+            #
+            stride_asm=-1,  # only used in blockwise fp8
+            stride_ask=-1,  # only used in blockwise fp8
+            stride_bse=-1,
+            stride_bsk=-1,
+            stride_bsn=-1,
+            group_n=-1,
+            group_k=-1,
+            # Meta-parameters
+            BLOCK_SIZE_M=config_up_gate_proj["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=config_up_gate_proj["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=config_up_gate_proj["BLOCK_SIZE_K"],
+            GROUP_SIZE_M=config_up_gate_proj["GROUP_SIZE_M"],
+            MUL_ROUTED_WEIGHT=False,
+            top_k=1,
+            compute_type_enum=1,
+            use_fp8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int8_w8a8=True,
+            per_channel_quant=False,
+            even_Ks=hidden_size % config_up_gate_proj["BLOCK_SIZE_K"] == 0,
+        )
+
+        down_proj_input = paddle.incubate.nn.functional.swiglu(up_gate_proj_out)
+
+        down_proj_out = paddle.empty(
+            (token_num * top_k, hidden_size),
+            dtype=x.dtype,
+        )
+
+        config_down_proj = {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+        }
+
+        grid = (
+            ceil_div(max_possible_num_post_padded, config_down_proj["BLOCK_SIZE_M"])
+            * ceil_div(hidden_size, config_down_proj["BLOCK_SIZE_N"]),
+        )
+        x_q, x_scale = scaled_int8_quant(down_proj_input, use_per_token_if_dynamic=True)
+
+        fused_moe_kernel_paddle[grid](
+            x_q,
+            layer.down_proj_weight,
+            down_proj_out,
+            x_scale,
+            layer.down_proj_weight_scale,
+            topk_weights,
+            sorted_token_ids,
+            expert_ids,
+            num_tokens_post_padded,
+            max_possible_num_post_padded,
+            token_num * top_k,
+            N=hidden_size,
+            K=moe_intermediate_size,
+            stride_am=down_proj_input.strides[0],
+            stride_ak=down_proj_input.strides[1],
+            stride_be=layer.down_proj_weight.strides[0],
+            stride_bk=layer.down_proj_weight.strides[1],
+            stride_bn=layer.down_proj_weight.strides[2],
+            stride_cm=down_proj_out.strides[0],
+            stride_cn=down_proj_out.strides[1],
+            stride_asm=-1,
+            stride_ask=-1,
+            stride_bse=-1,
+            stride_bsk=-1,
+            stride_bsn=-1,
+            group_n=-1,
+            group_k=-1,
+            # Meta-parameters
+            BLOCK_SIZE_M=config_down_proj["BLOCK_SIZE_M"],
+            BLOCK_SIZE_N=config_down_proj["BLOCK_SIZE_N"],
+            BLOCK_SIZE_K=config_down_proj["BLOCK_SIZE_K"],
+            GROUP_SIZE_M=config_down_proj["GROUP_SIZE_M"],
+            MUL_ROUTED_WEIGHT=True,
+            top_k=1,
+            compute_type_enum=1,
+            use_fp8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int8_w8a8=True,
+            per_channel_quant=False,
+            even_Ks=moe_intermediate_size % config_down_proj["BLOCK_SIZE_K"] == 0,
+        )
+
+        down_proj_out.reshape_([token_num, top_k, hidden_size])
+        out = down_proj_out.sum(axis=1)
 
         if layer.tp_size > 1:
             tensor_model_parallel_all_reduce(out)

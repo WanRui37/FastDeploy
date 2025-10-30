@@ -59,6 +59,7 @@ def fused_moe_kernel_paddle(
     compute_type_enum: tl.constexpr,
     use_fp8_w8a8: tl.constexpr,
     use_int8_w8a16: tl.constexpr,
+    use_int8_w8a8: tl.constexpr,  # 新增参数
     per_channel_quant: tl.constexpr,
     even_Ks: tl.constexpr,
 ):
@@ -116,6 +117,10 @@ def fused_moe_kernel_paddle(
     if use_int8_w8a16:
         b_scale_ptrs = b_scale_ptr + off_experts * stride_bse + offs_bn[None, :] * stride_bsn
         b_scale = tl.load(b_scale_ptrs)
+
+    if use_int8_w8a8:
+        a_scale = tl.load(a_scale_ptr + off_experts)
+        b_scale = tl.load(b_scale_ptr + off_experts)
 
     if use_fp8_w8a8:
         if group_k > 0 and group_n > 0:
@@ -180,6 +185,8 @@ def fused_moe_kernel_paddle(
         accumulator = accumulator * moe_weight[:, None]
     if use_int8_w8a16:
         accumulator = (accumulator * b_scale).to(compute_type)
+    elif use_int8_w8a8:
+        accumulator = (accumulator * a_scale * b_scale).to(compute_type)
     elif use_fp8_w8a8:
         if group_k > 0 and group_n > 0:
             accumulator = accumulator.to(compute_type)
