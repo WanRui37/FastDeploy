@@ -269,8 +269,30 @@ w8a8_gemm_tn(int m, int n, int k,
   auto sB = tile_to_shape(swizzle_atom, make_shape(bN,bK,bP));
   auto sC = make_layout(make_shape(bM, bN));
 
-  // Define the thread layouts (static)
-  // 修复：使用适合int8_t的CopyAtom和布局
+  // using CopyAtomType = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>;
+  // // using CopyAtomType = Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, cute::half_t>;
+  // using CopyAtomType = Copy_Atom<cute::UniversalCopy<cutlass::uint128_t>, int8_t>;
+  // using AtomLayoutRef = typename CopyAtomType::ValLayoutRef;
+  // using AtomNumThr = decltype(size<0>(AtomLayoutRef{}));
+  // using AtomNumVal = decltype(size<1>(AtomLayoutRef{}));
+  // using CopyAtomType = Layout<Shape<_16,_8>,Stride<_8,_1>>;
+  // using AtomLayoutRef = CopyAtomType;
+  // using AtomNumThr = decltype(size<0>(AtomLayoutRef{}));
+  // using AtomNumVal = decltype(size<1>(AtomLayoutRef{}));
+  // CUTE_STATIC_ASSERT_V(AtomNumThr{} == Int<1>{}, "TiledCopy no uses 1 thrs");
+  // CUTE_STATIC_ASSERT_V(AtomNumThr{} == Int<2>{}, "TiledCopy no uses 2 thrs");
+  // CUTE_STATIC_ASSERT_V(AtomNumThr{} == Int<4>{}, "TiledCopy no uses 4 thrs");
+  // CUTE_STATIC_ASSERT_V(AtomNumThr{} == Int<8>{}, "TiledCopy no uses 8 thrs");
+  // CUTE_STATIC_ASSERT_V(AtomNumThr{} == Int<16>{}, "TiledCopy no uses 16 thrs");
+  // CUTE_STATIC_ASSERT_V(AtomNumThr{} == Int<32>{}, "TiledCopy no uses 32 thrs");
+
+  // CUTE_STATIC_ASSERT_V(AtomNumVal{} == Int<1>{}, "TiledCopy no uses 1 val");
+  // CUTE_STATIC_ASSERT_V(AtomNumVal{} == Int<2>{}, "TiledCopy no uses 2 val");
+  // CUTE_STATIC_ASSERT_V(AtomNumVal{} == Int<4>{}, "TiledCopy no uses 4 val");
+  // CUTE_STATIC_ASSERT_V(AtomNumVal{} == Int<8>{}, "TiledCopy no uses 8 val");
+  // CUTE_STATIC_ASSERT_V(AtomNumVal{} == Int<16>{}, "TiledCopy no uses 16 val");
+  // CUTE_STATIC_ASSERT_V(AtomNumVal{} == Int<32>{}, "TiledCopy no uses 32 val");
+
   TiledCopy copyA = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>{},
                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{},  // Thr layout 16x8 k-major
                                     Layout<Shape< _1,_8>>{});               // Val layout  1x8 k-major
