@@ -386,7 +386,7 @@ elif paddle.is_compiled_with_cuda():
         sources += ["gpu_ops/int8_gemm_with_cutlass/gemm_dequant.cu"]
         # w8a8_group_gemm
         # sources += ["gpu_ops/int8_gemm_with_cute/sgemm_sm80.cu"]
-        sources += ["gpu_ops/int8_gemm_with_cute/w8a8_gemm_sm80.cu"]
+        # sources += ["gpu_ops/int8_gemm_with_cute/w8a8_gemm_sm80.cu"]
         # sources += ["gpu_ops/int8_gemm_with_cute/wfp8afp8_gemm_sm89.cu"]
         # sources += ["gpu_ops/int8_gemm_with_cutlass/w8a8_group_gemm_sm80.cu"]
         # sources += ["gpu_ops/int8_gemm_with_cutlass/w8a8_group_gemm_sm89.cu"]
