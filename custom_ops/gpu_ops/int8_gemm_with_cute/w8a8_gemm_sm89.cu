@@ -54,7 +54,7 @@ __global__ void w8a8_gemm_kernel(
     const typename KernelTraits::ElementA_* A,  // Activation matrix (M x K)
     const typename KernelTraits::ElementB_* B,  // Weight matrix (K x N)  
     typename KernelTraits::ElementC_* C,        // Output matrix (M x N)
-    int64_t M, int64_t N, int64_t K) {
+    int M, int N, int K) {
     
     using ElementA = typename KernelTraits::ElementA_;
     using ElementB = typename KernelTraits::ElementB_;
@@ -161,7 +161,7 @@ void w8a8_gemm_impl(
     const typename KernelTraits::ElementA_* A,
     const typename KernelTraits::ElementB_* B,
     typename KernelTraits::ElementC_* C,
-    int64_t M, int64_t N, int64_t K,
+    int M, int N, int K,
     cudaStream_t stream = 0) {
     
     static constexpr int kBlockM = KernelTraits::kBlockM;
@@ -184,7 +184,7 @@ std::vector<paddle::Tensor> W8A8GemmCute(
     const paddle::Tensor& weights,        // int8 weights (K x N)
     const paddle::Tensor& scales_a,       // float scales for activations (M,)
     const paddle::Tensor& scales_b,       // float scales for weights (N,)
-    int64_t M, int64_t N, int64_t K) {
+    int M, int N, int K) {
     
     // Validate input dimensions
     PADDLE_ENFORCE_EQ(activations.dtype(), paddle::DataType::INT8,
@@ -213,7 +213,7 @@ std::vector<paddle::Tensor> W8A8GemmCute(
     paddle::Tensor output_fp32 = paddle::empty({M, N}, paddle::DataType::FLOAT32, activations.place());
     
     // Simple scaling kernel (in real implementation, this would be optimized)
-    int64_t num_elements = M * N;
+    int num_elements = M * N;
     int block_size = 256;
     int num_blocks = (num_elements + block_size - 1) / block_size;
     
@@ -225,13 +225,13 @@ std::vector<paddle::Tensor> W8A8GemmCute(
     // Launch scaling kernel
     auto scaling_kernel = [] __global__ (
         const int32_t* input, float* output, const float* scales_a, const float* scales_b,
-        int64_t M, int64_t N, int64_t num_elements) {
+        int M, int N, int num_elements) {
         
-        int64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+        int idx = blockIdx.x * blockDim.x + threadIdx.x;
         if (idx >= num_elements) return;
         
-        int64_t row = idx / N;
-        int64_t col = idx % N;
+        int row = idx / N;
+        int col = idx % N;
         
         float scale = scales_a[row] * scales_b[col];
         output[idx] = static_cast<float>(input[idx]) * scale;

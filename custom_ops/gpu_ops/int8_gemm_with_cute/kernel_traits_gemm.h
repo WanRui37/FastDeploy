@@ -26,16 +26,14 @@ struct W8A8GemmKernelTraits {
     using ElementAccum = int32_t;  // W8A8 accumulates in int32
     
     // MMA configuration for W8A8 (int8 x int8 -> int32)
-    using MMA_Traits = cute::MMA_Traits<cute::SM89_16x8x32_S32S8S8S32_TN>;
-    using MMA_Atom = typename MMA_Traits::MMA_Atom;
     
     // Thread arrangement
     using ThreadLayout = Layout<Shape<Int<kNumWarps>, _1, _1>>;
     
     // Tiled MMA for the kernel
-    using TiledMma = TiledMMA<MMA_Atom, ThreadLayout, 
-                              Tile<Shape<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>, 
-                                   MMA_Traits>>;
+    using TiledMma = TiledMMA<MMA_Atom<cute::SM89_16x8x32_S32S8S8S32_TN>, 
+                                ThreadLayout, 
+                                Tile<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>>;
     
     // Shared memory layouts
     using SmemLayoutAtomA = Layout<Shape<_64, _32>, Stride<_32, _1>>;
