@@ -29,6 +29,10 @@
 #include "cute/algorithm/copy.hpp"
 #include <cute/atom/mma_traits.hpp>
 
+// 添加SM89架构的头文件
+#include "mma_sm89.hpp"
+#include "mma_traits_sm89.hpp"
+
 #include "paddle/extension.h"
 #include "helper.h"
 
@@ -40,6 +44,77 @@ struct SharedStorage {
   cute::ArrayEngine<ElementA, cute::cosize_v<SmemLayoutA>> A;
   cute::ArrayEngine<ElementB, cute::cosize_v<SmemLayoutB>> B;
 };
+
+// 从flash_attention.cu迁移的gemm函数实现
+namespace flash {
+
+// NOTE: A矩阵已经在寄存器中的gemm封装
+template<typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+         typename TiledMma, typename TiledCopy, typename ThrCopy>
+inline __device__ void gemm_A_in_regs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsB,
+                                      TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+                                      ThrCopy smem_thr_copy_B) {
+    // NOTE: 符合M N K描述: A[M, K] @ B[N, K] = C[M, N]
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    // NOTE: retile 成拷贝需要的大小
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+template<typename Tensor0, typename Tensor1,
+         typename Tensor2, typename Tensor3, typename Tensor4,
+         typename TiledMma, typename TiledCopyA, typename TiledCopyB,
+         typename ThrCopyA, typename ThrCopyB>
+inline __device__ void gemm_smem(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB, Tensor3 const& tCsA,
+                            Tensor4 const& tCsB, TiledMma tiled_mma,
+                            TiledCopyA smem_tiled_copy_A, TiledCopyB smem_tiled_copy_B,
+                            ThrCopyA smem_thr_copy_A, ThrCopyB smem_thr_copy_B) {
+    CUTE_STATIC_ASSERT_V(size<1>(tCrA) == size<1>(acc));                     // MMA_M
+    CUTE_STATIC_ASSERT_V(size<1>(tCrB) == size<2>(acc));                     // MMA_N
+    CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
+    Tensor tCrA_copy_view = smem_thr_copy_A.retile_D(tCrA);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
+    Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
+    CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+
+    // NOTE: s -> reg
+    cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{}));
+    cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
+    #pragma unroll
+    for (int i = 0; i < size<2>(tCrA); ++i) {
+        if (i < size<2>(tCrA) - 1) {
+            cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1));
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+        }
+        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+    }
+}
+
+// Blocks until all but N previous cp.async.commit_group operations have committed.
+// This differs from cute::cp_async_wait in that when N = 0 we don't call cp.async.wait_all
+// (which is equivalent to commit_group then wait_group 0).
+// Instead we just call cp.async.wait_group 0, which is slightly faster.
+// https://github.com/NVIDIA/cutlass/blob/master/include/cute/arch/copy_sm80.hpp#L113
+template <int N>
+CUTE_HOST_DEVICE
+void cp_async_wait() {
+#if defined(CUTE_ARCH_CP_ASYNC_SM80_ENABLED)
+    asm volatile("cp.async.wait_group %0;\n" :: "n"(N));
+#endif
+}
+
+} // namespace flash
 
 // Main GEMM device kernel (similar to sgemm_sm80.cu)
 template <class ProblemShape, class CtaTiler,
@@ -174,7 +249,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
   // PREFETCH register pipeline
   if (K_BLOCK_MAX > 1) {
     // Wait until our first prefetched tile is loaded in
-    cp_async_wait<K_PIPE_MAX-2>();
+    flash::cp_async_wait<K_PIPE_MAX-2>();
     __syncthreads();
 
     // Prefetch the first rmem from the first k-tile
@@ -196,7 +271,7 @@ gemm_device(ProblemShape shape_MNK, CtaTiler cta_tiler,
         tXsB_p = tXsB(_,_,_,smem_pipe_read);
 
         // Commit the smem for smem_pipe_read
-        cp_async_wait<K_PIPE_MAX-2>();
+        flash::cp_async_wait<K_PIPE_MAX-2>();
         __syncthreads();
       }
 
@@ -255,7 +330,7 @@ w8a8_gemm_nt(int m, int n, int k,
   // Define CTA tile sizes (static)
   auto bM = Int<128>{};
   auto bN = Int<128>{};
-  auto bK = Int<  8>{};
+  auto bK = Int<32>{};  // SM89使用32的K维度
   auto cta_tiler = make_shape(bM, bN, bK);                   // (BLK_M, BLK_N, BLK_K)
   auto bP = Int<3>{};  // Pipeline
 
@@ -296,20 +371,18 @@ w8a8_gemm_nt(int m, int n, int k,
   TiledCopy copyB = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, int8_t>{},
                                     Layout<Shape<_16,_8>,Stride<_8,_1>>{},  
                                     Layout<Shape< _1,_8>>{});               
-  using GmemTiledCopyA = decltype(
-    make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<cute::uint128_t>, int8_t>{},
-                    Layout<Shape <_32,_4>,
-                           Stride< _4,_1>>{},
-                    Layout<Shape<_1,Int<kAlignmentA>>>{}));
+
+  // 使用SM89的MMA指令
   using TiledMma = TiledMMA<
-      MMA_Atom<SM80_16x8x32_S32S8S8S32_TN>,
+      MMA_Atom<SM89_16x8x32_S32S8S8S32_TN>,
       Layout<Shape<_2,_2,_1>>,   // 2x2x1 thread group
       Tile<_32,_32,_32>>;        // 16x16x32 MMA for LDSM, 1x2x1 value group
-  TiledMMA mmaC = make_tiled_mma(SM80_16x8x16_S32S8S8S32_TN{},
-                                 Layout<Shape<_2,_2>>{},
-                                 Tile<_32,_32,_16>{});   
 
-  // 修复：使用适合int8_t的s2r_atom
+  TiledMMA mmaC = make_tiled_mma(SM89_16x8x32_S32S8S8S32_TN{},
+                                 Layout<Shape<_2,_2>>{},
+                                 Tile<_32,_32,_32>{});   
+
+  // 使用适合SM89的s2r_atom
   Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2r_atom_A;
   Copy_Atom<SM75_U32x4_LDSM_N, int8_t> s2r_atom_B;
 
@@ -393,8 +466,8 @@ std::vector<paddle::Tensor> W8A8GemmCuteImpl(
                                                paddle::DataType::INT32, 
                                                activations.place());
     
-    // Choose appropriate MMA traits for W8A8
-    using MMA_Traits = cute::MMA_Traits<cute::SM80_16x8x16_S32S8S8S32_TN>;
+    // Choose appropriate MMA traits for W8A8 with SM89
+    using MMA_Traits = cute::MMA_Traits<cute::SM89_16x8x32_S32S8S8S32_TN>;
     
     // Call CUTE-based kernel
     cute_w8a8_gemm_kernel<MMA_Traits>(
