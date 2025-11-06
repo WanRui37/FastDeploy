@@ -36,8 +36,14 @@ struct W8A8GemmKernelTraits {
                                 Tile<Int<kBlockM>, Int<kBlockN>, Int<kBlockK>>>;
     
     // Shared memory layouts
-    using SmemLayoutAtomA = Layout<Shape<_64, _32>, Stride<_32, _1>>;
-    using SmemLayoutAtomB = Layout<Shape<_32, _64>, Stride<_64, _1>>;
+    static constexpr int kSmemTileM = 64;  // 128能被64整除
+    static constexpr int kSmemTileK = 32;  // 32能被32整除
+    static constexpr int kSmemTileN = 64;  // 128能被64整除
+    
+    using SmemLayoutAtomA = Layout<Shape<Int<kSmemTileM>, Int<kSmemTileK>>, 
+                                   Stride<Int<kSmemTileK>, _1>>;
+    using SmemLayoutAtomB = Layout<Shape<Int<kSmemTileN>, Int<kSmemTileK>>, 
+                                   Stride<Int<kSmemTileK>, _1>>;
     
     using SmemLayoutA = decltype(tile_to_shape(
         SmemLayoutAtomA{},
@@ -52,17 +58,19 @@ struct W8A8GemmKernelTraits {
     using SmemCopyAtomB = Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementB>;
     
     // Tiled copies for shared memory
-    using GmemLayoutAtom = Layout<Shape<Int<kNumThreads/4>, Int<4>>, Stride<Int<4>, _1>>;
+    using GmemLayoutAtom = Layout<Shape<Int<kNumThreads/8>, Int<8>>, Stride<Int<8>, _1>>;
     
+    static constexpr int kElementsPerThread = 16;
+
     using GmemTiledCopyA = decltype(
         make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementA>{},
                         GmemLayoutAtom{},
-                        Layout<Shape<_1, _8>>{}));
+                        Layout<Shape<_1, Int<kElementsPerThread>>>{}));
     
     using GmemTiledCopyB = decltype(
         make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, ElementB>{},
                         GmemLayoutAtom{},
-                        Layout<Shape<_1, _8>>{}));
+                        Layout<Shape<_1, Int<kElementsPerThread>>>{}));
     
     // Shared memory size calculation
     static constexpr int kSmemSizeA = cute::cosize_v<SmemLayoutA> * sizeof(ElementA);

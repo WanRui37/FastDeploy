@@ -178,6 +178,24 @@ void w8a8_gemm_impl(
     w8a8_gemm_kernel<KernelTraits><<<grid, block, kSmemSize, stream>>>(A, B, C, M, N, K);
 }
 
+// Scaling kernel for W8A8 GEMM (int32 -> float32 with scaling)
+__global__ void w8a8_gemm_scaling_kernel(
+    const int32_t* input, 
+    float* output, 
+    const float* scales_a, 
+    const float* scales_b,
+    int M, int N, int num_elements) {
+    
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_elements) return;
+    
+    int row = idx / N;
+    int col = idx % N;
+    
+    float scale = scales_a[row] * scales_b[col];
+    output[idx] = static_cast<float>(input[idx]) * scale;
+}
+
 // Paddle operator implementation for W8A8 GEMM
 std::vector<paddle::Tensor> W8A8GemmCute(
     const paddle::Tensor& activations,    // int8 activations (M x K)
@@ -222,22 +240,8 @@ std::vector<paddle::Tensor> W8A8GemmCute(
     auto* int32_data = output_int32.data<int32_t>();
     auto* fp32_data = output_fp32.data<float>();
     
-    // Launch scaling kernel
-    auto scaling_kernel = [] __global__ (
-        const int32_t* input, float* output, const float* scales_a, const float* scales_b,
-        int M, int N, int num_elements) {
-        
-        int idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (idx >= num_elements) return;
-        
-        int row = idx / N;
-        int col = idx % N;
-        
-        float scale = scales_a[row] * scales_b[col];
-        output[idx] = static_cast<float>(input[idx]) * scale;
-    };
-    
-    scaling_kernel<<<num_blocks, block_size, 0, activations.stream()>>>(
+    // Launch scaling kernel using the external function
+    w8a8_gemm_scaling_kernel<<<num_blocks, block_size, 0, activations.stream()>>>(
         int32_data, fp32_data, scales_a_data, scales_b_data, M, N, num_elements);
     
     return {output_fp32};
